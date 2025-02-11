@@ -55,7 +55,8 @@ def init():
     print("Initializing the application...")
 
     # Load existing configuration (if any)
-    load_config()
+    global config
+    config = load_config()
     
     # Create or patch your OpenAI client
     client = patch(OpenAI())
