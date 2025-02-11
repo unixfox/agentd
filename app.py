@@ -32,7 +32,7 @@ def load_config():
     # If the file doesn’t exist or an error occurs, return a copy of the defaults.
     return default_config.copy()
 
-def save_config(config):
+def save_config():
     """Save the configuration to the JSON file."""
     try:
         with open(config_file, "w") as f:
@@ -55,7 +55,7 @@ def init():
     print("Initializing the application...")
 
     # Load existing configuration (if any)
-    config = load_config()
+    load_config()
     
     # Create or patch your OpenAI client
     client = patch(OpenAI())
@@ -69,7 +69,7 @@ def init():
         # Adjust the parameters/method as required by your API.
         assistant = client.beta.assistants.create(model="gpt-4o-mini")  
         config["assistant_id"] = assistant.id
-        save_config(config)
+        save_config()
     else:
         print("Found existing assistant_id, retrieving assistant.")
         assistant = client.beta.assistants.retrieve(config["assistant_id"])
@@ -91,7 +91,7 @@ def run():
         thread_id = result.get("thread_id")
         if thread_id:
             config["thread_id"] = thread_id
-            save_config(config)
+            save_config()
             print("New thread started with thread_id:", thread_id)
         else:
             print("Warning: No thread_id returned from run_thread.")
