@@ -55,7 +55,7 @@ def init():
     print("Initializing the application...")
 
     # Load existing configuration (if any)
-    global config
+    global config, assistant, assistant_manager
     config = load_config()
     
     # Create or patch your OpenAI client
@@ -83,6 +83,7 @@ def init():
         assistant_id=assistant.id,
         instructions=None
     )
+    return assistant_manager
     
 def run():
     prompt = "draw a cat"
@@ -106,5 +107,5 @@ def run():
     print("Final Thread ID:", config.get("thread_id"))
 
 if __name__ == "__main__":
-    init()
+    assistant_manager = init()
     run()
