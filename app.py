@@ -5,8 +5,10 @@ from openai import OpenAI
 from astra_assistants import patch
 from astra_assistants.astra_assistants_manager import AssistantManager
 from appdirs import user_config_dir
+from astra_assistants.mcp_openai_adapter import MCPRepresentationStdio
 
-APP_NAME = "mcp-maker"
+
+APP_NAME = "agentd"
 APP_AUTHOR = "phact"
 
 # Determine the correct configuration directory and file path.
@@ -20,17 +22,24 @@ default_config = {
     "thread_id": None
 }
 
+config=None
+assistant_manager = None
+thread_id = None
+assistant_id = None
+continue_thread = False
+
 def load_config():
     """Load configuration from the JSON file, or return defaults if missing."""
+    global config
     if os.path.exists(config_file):
         try:
             with open(config_file, "r") as f:
                 config = json.load(f)
-            return config
+            return
         except Exception as e:
             print(f"Error loading config: {e}")
     # If the file doesn’t exist or an error occurs, return a copy of the defaults.
-    return default_config.copy()
+    config = default_config.copy()
 
 def save_config():
     """Save the configuration to the JSON file."""
@@ -40,7 +49,7 @@ def save_config():
     except Exception as e:
         print(f"Error saving config: {e}")
 
-async def run_thread(assistant_manager, prompt):
+async def run_thread(prompt, thread_id):
     """
     Run a thread (conversation) with the assistant.
     
@@ -48,64 +57,75 @@ async def run_thread(assistant_manager, prompt):
     interacts with the API. This function is expected to return a dictionary
     that contains at least a 'thread_id' key when a new thread is created.
     """
-    result = await assistant_manager.run_thread(content=prompt)
+    result = await assistant_manager.run_thread(content=prompt, thread_id=thread_id)
     return result
 
-def init():
+def init_manager(instructions: str):
     print("Initializing the application...")
 
     # Load existing configuration (if any)
-    global config, assistant, assistant_manager
-    config = load_config()
-    
+    global config, assistant_manager, continue_thread
+
+    mcps = [
+        MCPRepresentationStdio(
+            type="stdio",
+            command="uv",
+            arguments=[
+                "run",
+                "--with",
+                "../mcp-google-docs",
+                "server",
+                "--creds-file-path",
+                "../mcp-google-docs/.auth/client_secret_1049158366095-o78hnepquu77t0uf3gr7q5ik887a6tvv.apps.googleusercontent.com.json",
+                "--token-path",
+                "../mcp-google-docs/.auth/token"
+            ]
+        )
+    ]
+
+    load_config()
+    if continue_thread:
+        thread_id = config.get("thread_id", None)
+    assistant_id = config.get("assistant_id", None)
+
     # Create or patch your OpenAI client
     client = patch(OpenAI())
     
-    # -------------------------------
-    # Handle the assistant_id
-    # -------------------------------
-    if not config.get("assistant_id"):
-        print("No assistant_id found, creating a new assistant.")
-        # Create a new assistant.
-        # Adjust the parameters/method as required by your API.
-        assistant = client.beta.assistants.create(model="gpt-4o-mini")  
-        config["assistant_id"] = assistant.id
-        save_config()
-    else:
-        print("Found existing assistant_id, retrieving assistant.")
-        assistant = client.beta.assistants.retrieve(config["assistant_id"])
-    
-    print("Assistant:", assistant)
-    
     # Create the AssistantManager with the assistant's ID.
+    print(assistant_id)
     assistant_manager = AssistantManager(
         client=client,
-        assistant_id=assistant.id,
-        instructions=None
+        instructions=instructions,
+        assistant_id=assistant_id,
+        mcp_represenations=mcps
     )
-    return assistant_manager
+    if not assistant_id:
+        config["assistant_id"] = assistant_manager.assistant.id
+        save_config()
+        print("New assitant created with assistant_id:", assistant_id)
     
-def run():
-    prompt = "draw a cat"
-    if not config.get("thread_id"):
-        result = asyncio.run(run_thread(assistant_manager, prompt))
-        
-        thread_id = result.get("thread_id")
-        if thread_id:
-            config["thread_id"] = thread_id
-            save_config()
-            print("New thread started with thread_id:", thread_id)
-        else:
-            print("Warning: No thread_id returned from run_thread.")
-    else:
-        # If a thread_id exists, you might choose to continue that conversation.
-        print("Using existing thread_id:", config["thread_id"])
-        result = asyncio.run(run_thread(assistant_manager, prompt))
-        print("Thread response:", result)
-    
-    print("Final Assistant ID:", assistant.id)
-    print("Final Thread ID:", config.get("thread_id"))
+def run(prompt: str):
+    global thread_id
+    new_thread = not thread_id
+    if new_thread:
+        thread_id = config.get("thread_id")
+    result = asyncio.run(run_thread(prompt, thread_id))
+    if new_thread:
+        config["thread_id"] = assistant_manager.thread.id
+        save_config()
+        print("New thread started with thread_id:", thread_id)
+    print(result)
+    print(result['text'])
+    for tool in assistant_manager.tools:
+        if tool.name == "read-comments":
+            model = tool.get_model()
+            # model is a BaseModel so you could introspect...
+            model.model_fields.values()
+            # and then to call the tool pass it a dict
+            result = tool.call(model(title="title").dump_model())
 
 if __name__ == "__main__":
-    assistant_manager = init()
-    run()
+    instructions = "You are a long running agent that assists with google docs"
+    prompt = "create a new doc"
+    init_manager(instructions)
+    run(prompt)
