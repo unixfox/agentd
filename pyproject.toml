@@ -8,3 +8,6 @@ dependencies = [
     "appdirs>=1.4.4",
     "astra-assistants>=2.3.1",
 ]
+
+[tool.uv.sources]
+astra-assistants = { path = "../astra-assistants-api/client" }
