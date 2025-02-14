@@ -61,7 +61,7 @@ class DoneTool(ToolInterface):
     def call(self, args: Done):
         instructions = (
             f"## Context:\n"
-            f"*Note: remember to use your tools to accomplish the task and to validate that changes to artifacts are persisted*"
+            f"*Note: remember to use your tools to write to the document and to validate that changes were persisted*\n"
             f"{args.to_string()}\n"
         )
 

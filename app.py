@@ -33,11 +33,16 @@ thread_id = None
 assistant_id = None
 
 # Global caches to detect changes
-last_comment_ids = set()
 last_modified_time = None
 
 # Global tool cache
 tool_cache = {}
+
+new_comment_event = asyncio.Event()
+
+async def async_input(prompt: str) -> str:
+    # Wrap the blocking input in a thread
+    return await asyncio.to_thread(input, prompt)
 
 def load_config():
     global config
@@ -59,7 +64,6 @@ def save_config():
 
 async def check_done():
     global thread_id, done_manager
-    print(f"done tool thread: {thread_id}")
     tool = DoneTool()
     result = await done_manager.run_thread(content="Has the last user request been completed?", thread_id=thread_id, tool=tool)
     arguments = result.get("arguments")
@@ -164,44 +168,75 @@ def call_tool_with_introspection(tool, provided_params: dict):
     """
     model_cls = tool.get_model()  # Get the model class
     # Collect valid parameters by filtering based on the model's fields
-    valid_fields = set(model_cls.__fields__.keys())
+    valid_fields = set(model_cls.model_fields.keys())
     valid_params = {k: v for k, v in provided_params.items() if k in valid_fields}
 
     # Check for missing required fields
-    for field_name, field_info in model_cls.__fields__.items():
+    for field_name, field_info in model_cls.model_fields.items():
         if field_info.is_required() and field_name not in valid_params:
             raise ValueError(f"Missing required parameter: {field_name}")
 
     instance = model_cls(**valid_params)
     return tool.call(instance)
 
-async def cli_loop():
+async def cli_loop(doc_id: str):
     """Continuously prompt the user for input from the CLI."""
     global thread_id
     is_complete = True
     iterations = 0
+    chat_result = None
     while True:
         if is_complete or iterations > MAX_ITERATIONS:
             iterations = 0
-            prompt = await asyncio.to_thread(input, "Enter your prompt (or 'exit' to quit): ")
+            # Create a task for user input and one for the comment event.
+            input_task = asyncio.create_task(async_input("Enter your prompt (or 'exit' to quit): "))
+            event_task = asyncio.create_task(new_comment_event.wait())
+
+            # Wait until either input is received or a new comment is detected.
+            done, pending = await asyncio.wait(
+                [input_task, event_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # If a new comment was detected, cancel the input and jump to the next loop iteration.
+            if event_task in done:
+                new_comment_event.clear()  # Reset the event.
+                input_task.cancel()         # Cancel the input task (it may still complete later, but we ignore it).
+                print("New comment received; interrupting input and checking updates.")
+                is_complete = False
+                continue  # Jump back into the loop (or perform other actions if needed).
+
+            # Otherwise, the user provided input.
+            prompt = input_task.result()
             if prompt.strip().lower() == "exit":
                 print("Exiting...")
                 break
 
-            await chat(prompt)
+            chat_result = await chat(prompt)
 
         done_result = await check_done()
         is_complete = done_result['args'].is_complete
-        if not is_complete:
+
+        iterations += 1
+        if not is_complete and iterations < MAX_ITERATIONS:
             print(f"iterations {iterations}/{MAX_ITERATIONS}")
-            await chat(f"You're not quite done\n{done_result['args']}\nPlease continue")
-            iterations += 1
+            chat_result = await chat(f"You're not quite done\n{done_result['args']}\nPlease continue")
         else:
+            add_comment_result = await add_comment(doc_id=doc_id, comment=done_result['output'])
             iterations = 0
 
+async def add_comment(doc_id: str, comment: str):
+    create_comment_tool = tool_cache.get("create-comment")
+    if not create_comment_tool:
+        print("Tool 'create-comment' not found in cache.")
+        return
+    return call_tool_with_introspection(create_comment_tool, {"document_id": doc_id, "content": comment, "start_offset": 1, "length": 1 })
+
+
+
+
+
 async def poll_comments(doc_id):
-    """Background task that polls for changes in comments using the 'read-comments' tool."""
-    global last_comment_ids
     read_comments_tool = tool_cache.get("read-comments")
     if not read_comments_tool:
         print("Tool 'read-comments' not found in cache.")
@@ -216,15 +251,14 @@ async def poll_comments(doc_id):
             await asyncio.sleep(10)
             continue
 
-        # Assume result is a dict with a key "comments" that is a list of comment IDs.
+        # Assume result['output'] is a string representation of a list of comment dicts.
         comments = ast.literal_eval(result['output'])
-        new_comments = []
         for comment in comments:
             modified = datetime.strptime(comment['modifiedTime'][:-1], "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=timezone.utc).timestamp()
             if modified > last_time:
-                new_comments.append(comment)
                 await chat(f"New comment detected in document {doc_id}, check comments")
                 last_time = time.time()
+                new_comment_event.set()  # Trigger the event.
         await asyncio.sleep(10)  # Adjust polling interval as needed
 
 async def poll_doc_changes(doc_id):
@@ -280,7 +314,7 @@ async def main():
     await chat(prompt="What tools do you have access to? Make sure you use them going forward.")
     thread_id = assistant_manager.thread.id
     tasks = [
-        asyncio.create_task(cli_loop()),
+        asyncio.create_task(cli_loop(doc_id)),
         asyncio.create_task(poll_comments(doc_id)),
         asyncio.create_task(poll_doc_changes(doc_id))
     ]
