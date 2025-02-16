@@ -103,7 +103,7 @@ wheels = [
 
 [[package]]
 name = "astra-assistants"
-version = "2.3.1"
+version = "2.3.2"
 source = { directory = "../astra-assistants-api/client" }
 dependencies = [
     { name = "aiohttp" },
