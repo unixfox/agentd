@@ -3,6 +3,8 @@ import os
 import json
 import asyncio
 import time
+import re
+from loguru import logger
 from datetime import datetime, timezone
 
 from tools.done_tool import DoneTool
@@ -34,16 +36,18 @@ class ConfigManager:
             try:
                 with open(self.config_file, "r") as f:
                     self.config = json.load(f)
+                logger.debug(f"Loaded config: {self.config}")
             except Exception as e:
-                print(f"Error loading config: {e}")
+                logger.error(f"Error loading config: {e}")
         return self.config
 
     def save_config(self):
         try:
             with open(self.config_file, "w") as f:
                 json.dump(self.config, f, indent=4)
+            logger.debug(f"Saved config: {self.config}")
         except Exception as e:
-            print(f"Error saving config: {e}")
+            logger.error(f"Error saving config: {e}")
 
     def get(self, key, default=None):
         return self.config.get(key, default)
@@ -53,7 +57,7 @@ class ConfigManager:
         self.save_config()
 
 
-class Agent:
+class Agentd:
     MAX_ITERATIONS = 5
 
     def __init__(self, instructions: str, config_manager: ConfigManager, mcps: MCPRepresentation):
@@ -75,6 +79,9 @@ class Agent:
         self.chat_result = None
         self.last_modified_time = None
 
+        # Store document id once known.
+        self.doc_id = None
+
         self._init_managers(mcps)
 
     def _init_managers(self, mcps: MCPRepresentation):
@@ -93,6 +100,7 @@ class Agent:
         if not self.assistant_id:
             self.config_manager.set("assistant_id", self.assistant_manager.assistant.id)
             self.assistant_id = self.assistant_manager.assistant.id
+            logger.info(f"New assistant created with id: {self.assistant_id}")
 
         self.cache_tools()
 
@@ -112,12 +120,14 @@ class Agent:
         )
         if not done_assistant_id:
             self.config_manager.set("done_assistant_id", self.done_manager.assistant.id)
+            logger.info(f"New done assistant created with id: {self.done_manager.assistant.id}")
 
     def cache_tools(self):
         """Caches available tools by name for fast lookup."""
         self.tool_cache = {}
         for tool in self.assistant_manager.tools:
             self.tool_cache[tool.mcp_tool.name] = tool
+        logger.debug(f"Cached tools: {list(self.tool_cache.keys())}")
 
     @staticmethod
     def call_tool_with_introspection(tool, provided_params: dict):
@@ -148,25 +158,65 @@ class Agent:
             thread_id=self.thread_id,
             tool=tool,
         )
+        logger.debug(f"Done check result: {result}")
         return result
 
+    def extract_rewrite_content(self, text: str) -> str:
+        """
+        Look for content wrapped in triple backticks.
+        Returns the first code block found (stripped), or None.
+        """
+        pattern = r"```(.*?)```"
+        matches = re.findall(pattern, text, re.DOTALL)
+        if matches:
+            content = matches[0].strip()
+            logger.debug(f"Extracted rewrite content: {content}")
+            return content
+        return None
+
+    def process_rewrite_content(self, content: str):
+        """
+        Call the rewrite-document tool using the provided content.
+        """
+        rewrite_tool = self.tool_cache.get("rewrite-document")
+        if not rewrite_tool:
+            logger.error("Tool 'rewrite-document' not found in cache.")
+            return
+        try:
+            result = self.call_tool_with_introspection(
+                rewrite_tool, {"document_id": self.doc_id, "final_text": content}
+            )
+            logger.info(f"Rewrite-document tool call result: {result.get('output', 'No output')}")
+            return result
+        except Exception as e:
+            logger.error(f"Error calling rewrite-document tool: {e}")
+            return None
+
     async def chat(self, prompt: str):
-        """Send a prompt to the assistant manager and display the response."""
+        """
+        Send a prompt to the assistant manager, display the response,
+        and if content is enclosed in triple backticks, process a document rewrite.
+        """
         self.chat_result = await self.assistant_manager.run_thread(content=prompt, thread_id=self.thread_id)
         arguments = self.chat_result.get("arguments")
         if arguments is not None:
-            print(
-                f"Tool Call: {arguments.__class__.__name__}({arguments}) \nTool Call Result: {self.chat_result['output']}"
-            )
-        print("Assistant response:")
-        print(self.chat_result.get("text", "No text response found."))
+            logger.info(f"Tool Call: {arguments.__class__.__name__}({arguments}) \nTool Call Result: {self.chat_result['output']}")
+        text = self.chat_result.get("text", "No text response found.")
+        logger.info(f"Assistant response: {text}")
+
+        # Look for triple-backtick wrapped content.
+        rewrite_content = self.extract_rewrite_content(text)
+        if rewrite_content and self.doc_id:
+            logger.info("Detected rewrite content in triple backticks; calling rewrite-document tool...")
+            self.process_rewrite_content(rewrite_content)
+            await self.chat(f"Here is the current content of the document: {rewrite_content}")
         return self.chat_result
 
     async def add_comment(self, doc_id: str, comment: str):
         """Add a new comment using the appropriate tool."""
         create_comment_tool = self.tool_cache.get("create-comment")
         if not create_comment_tool:
-            print("Tool 'create-comment' not found in cache.")
+            logger.error("Tool 'create-comment' not found in cache.")
             return
         return self.call_tool_with_introspection(create_comment_tool, {"document_id": doc_id, "content": comment})
 
@@ -201,7 +251,7 @@ class Agent:
                 if event_task in done:
                     self.new_comment_event.clear()
                     input_task.cancel()
-                    print("New comment received; switching to comment interaction.")
+                    logger.info("New comment received; switching to comment interaction.")
                     self.interaction_origin = "comment"
                     is_complete = False
                     continue
@@ -209,23 +259,24 @@ class Agent:
                 # CLI input was received.
                 prompt = input_task.result()
                 if prompt.strip().lower() == "exit":
-                    print("Exiting...")
+                    logger.info("Exiting...")
                     break
                 await self.chat(prompt)
 
-            print(self.chat_result)
+            logger.debug(f"Chat result: {self.chat_result}")
 
             # If the response calls a tool, let it finish before counting an iteration.
             if "arguments" in self.chat_result:
                 await self.chat("continue")
                 continue
 
+            await self.chat("continue")
             done_result = await self.check_done()
             is_complete = done_result["args"].is_complete
             iterations += 1
 
             if not is_complete and iterations < self.MAX_ITERATIONS:
-                print(f"iterations {iterations}/{self.MAX_ITERATIONS}")
+                logger.info(f"iterations {iterations}/{self.MAX_ITERATIONS}")
                 await self.chat(f"You're not quite done:\n{done_result['args']}\nPlease continue")
             elif is_complete:
                 summary_result = await self.chat("Looks like you completed the task, please summarize your work.")
@@ -245,7 +296,7 @@ class Agent:
                         comment_id=self.current_comment_id,
                         reply=summary_result.get("text", "No summary provided."),
                     )
-                    print("Posted reply comment:", reply_result.get("output", "No output"))
+                    logger.info(f"Posted reply comment: {reply_result.get('output', 'No output')}")
                     self.interaction_origin = "cli"
                     self.current_comment_id = None
 
@@ -253,7 +304,7 @@ class Agent:
         """Poll for new comments in the document and notify the agent."""
         read_comments_tool = self.tool_cache.get("read-comments")
         if not read_comments_tool:
-            print("Tool 'read-comments' not found in cache.")
+            logger.error("Tool 'read-comments' not found in cache.")
             return
 
         last_time = 0
@@ -261,7 +312,7 @@ class Agent:
             try:
                 result = self.call_tool_with_introspection(read_comments_tool, {"document_id": doc_id})
             except Exception as e:
-                print("Error calling read-comments tool:", e)
+                logger.error(f"Error calling read-comments tool: {e}")
                 await asyncio.sleep(10)
                 continue
 
@@ -274,14 +325,12 @@ class Agent:
                     continue
                 if modifiedTime > last_time:
                     # Skip comments already replied to.
-                    if "replies" in comment and comment["replies"] and comment["replies"][-1]["content"].startswith(
-                            "[BOT COMMENT]"
-                    ):
+                    if "replies" in comment and comment["replies"] and comment["replies"][-1]["content"].startswith("[BOT COMMENT]"):
                         continue
                     self.interaction_origin = "comment"
                     self.current_comment_id = comment.get("id")
                     await self.reply_comment(doc_id, comment["id"], "👀")
-                    print(f"New comment detected in document {doc_id}.")
+                    logger.info(f"New comment detected in document {doc_id}.")
                     await self.chat(f"New comment detected in document {doc_id}: {comment}.")
                     last_time = time.time()
                     self.new_comment_event.set()
@@ -291,7 +340,7 @@ class Agent:
         """Poll for document changes and notify the agent if the document was updated."""
         read_doc_tool = self.tool_cache.get("read-doc")
         if not read_doc_tool:
-            print("Tool 'read-doc' not found in cache.")
+            logger.error("Tool 'read-doc' not found in cache.")
             return
 
         last_result = None
@@ -300,7 +349,7 @@ class Agent:
             try:
                 result = self.call_tool_with_introspection(read_doc_tool, {"document_id": doc_id})
             except Exception as e:
-                print("Error calling read-doc tool:", e)
+                logger.error(f"Error calling read-doc tool: {e}")
                 await asyncio.sleep(10)
                 continue
 
@@ -310,7 +359,7 @@ class Agent:
                 last_result = result
                 current_time = time.time()
                 if current_time - last_prompt_time > 30:
-                    print(f"Detected change in document {doc_id}.")
+                    logger.info(f"Detected change in document {doc_id}.")
                     await self.chat(f"Doc changes detected for doc: {doc_id}:\n{result}")
                     last_prompt_time = current_time
             await asyncio.sleep(10)
@@ -319,7 +368,7 @@ class Agent:
         """Create a new document using the create-doc tool."""
         create_doc_tool = self.tool_cache.get("create-doc")
         result = self.call_tool_with_introspection(create_doc_tool, {"title": "New Doc"})
-        print(f"Assistant response: {result['output']}")
+        logger.info(f"Assistant response: {result['output']}")
         doc_id = result["output"].split(":")[2].split("/")[5]
         return doc_id
 
@@ -327,17 +376,17 @@ class Agent:
         """Clear acknowledgment replies in the document."""
         read_comments_tool = self.tool_cache.get("read-comments")
         if not read_comments_tool:
-            print("Tool 'read-comments' not found in cache.")
+            logger.error("Tool 'read-comments' not found in cache.")
             return
         delete_reply_tool = self.tool_cache.get("delete-reply")
         if not delete_reply_tool:
-            print("Tool 'delete-reply' not found in cache.")
+            logger.error("Tool 'delete-reply' not found in cache.")
             return
 
         try:
             result = self.call_tool_with_introspection(read_comments_tool, {"document_id": doc_id})
         except Exception as e:
-            print("Error calling read-comments tool:", e)
+            logger.error(f"Error calling read-comments tool: {e}")
             return
 
         comments = ast.literal_eval(result["output"])
@@ -352,12 +401,14 @@ class Agent:
                             delete_reply_tool,
                             {"document_id": doc_id, "comment_id": comment_id, "reply_id": reply_id},
                         )
+                        logger.debug(f"Cleared ack for comment {comment_id}")
                     except Exception as e:
-                        print("Error calling delete-reply tool:", e)
+                        logger.error(f"Error calling delete-reply tool: {e}")
                         return
 
     async def run(self, doc_id: str):
         """Start the agent’s main event loop."""
+        self.doc_id = doc_id  # Save the doc_id so it can be used for rewriting
         await self.clear_acks(doc_id)
         await self.chat(prompt="What tools do you have access to? Make sure you use them going forward.")
         self.thread_id = self.assistant_manager.thread.id
@@ -371,13 +422,17 @@ class Agent:
 
 async def main():
     instructions = (
-        "You are a long running agent that assists with google docs and helps the user with docs related tasks. "
-        "Additionally, you may be notified of doc changes and comments. "
+        "You are a long running document writing agent. "
+        "You will be notified of doc changes and comments. "
+        "When you want to update the document, please enclose your new content in triple backticks (```your content```). "
+        "I will then automatically update the document using that content. "
         "When in doubt, ensure you are looking at the latest version of the doc. "
         "Don't use any markdown in the google doc."
+        "Always include URLs in your citations when referencing content from search tools."
     )
     config_manager = ConfigManager(app_name="agentd", app_author="phact")
 
+    brave_key = os.environ['BRAVE_API_KEY']
     mcps = [
         MCPRepresentationStdio(
             type="stdio",
@@ -393,11 +448,33 @@ async def main():
                 "--token-path",
                 "../mcp-google-docs/.auth/token",
             ],
-            tool_filter=['read-doc','rewrite-document']
+            tool_filter=['read-doc']
+        ),
+        MCPRepresentationStdio(
+            type="stdio",
+            command="npx",
+            arguments=[
+                "-y",
+                "@modelcontextprotocol/server-brave-search"
+            ],
+            env_vars=[
+                f"BRAVE_API_KEY={brave_key}"
+            ]
+        ),
+        MCPRepresentationStdio(
+            type="stdio",
+            command="uv",
+            arguments=[
+                "run",
+                "--refresh",
+                "--with",
+                "mcp_simple_arxiv",
+                "mcp-simple-arxiv",
+            ],
         )
     ]
 
-    agent = Agent(instructions, config_manager, mcps)
+    agent = Agentd(instructions, config_manager, mcps)
     # Uncomment the next line to create a new document
     # doc_id = await agent.create_doc()
     doc_id = "1A4ZGfs-h2N145Blhmrj7vUFet5gNYTHnohs6O3JRsoE"
