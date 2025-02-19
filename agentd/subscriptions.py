@@ -111,6 +111,7 @@ def markdown_to_slack(text):
         return f'<{match.group(2)}|{match.group(1)}>'
     return re.sub(pattern, repl, text)
 
+
 class SlackSubscription(Subscription):
     async def poll(self):
         slack_history_tool = self.agent.tool_cache.get("slack_get_channel_history")
@@ -121,6 +122,11 @@ class SlackSubscription(Subscription):
         slack_post_message_tool = self.agent.tool_cache.get("slack_post_message")
         if not slack_post_message_tool:
             logger.error("Tool 'slack_post_message' not found in cache.")
+            return
+
+        slack_add_reaction_tool = self.agent.tool_cache.get("slack_add_reaction")
+        if not slack_add_reaction_tool:
+            logger.error("Tool 'slack_add_reaction' not found in cache.")
             return
 
         channel_id = self.identifier
@@ -146,6 +152,9 @@ class SlackSubscription(Subscription):
                 await asyncio.sleep(10)
                 continue
 
+            if messages[0]['text'].startswith("[BOT COMMENT]:"):
+                await asyncio.sleep(10)
+                continue
             for msg in messages:
                 try:
                     ts = float(msg.get("ts", "0"))
@@ -157,15 +166,23 @@ class SlackSubscription(Subscription):
                 if text.startswith("[BOT COMMENT]:"):
                     continue
 
-                if ts > last_timestamp:
-                    logger.info(f"New Slack message detected: {text}")
-                    chat_result = await self.agent.chat(f"New Slack message: {text}")
-                    # Convert the response and include the bot marker.
-                    response_text = markdown_to_slack(chat_result['text'])
-                    text_for_post = f"[BOT COMMENT]:\n{response_text}"
-                    self.agent.call_tool_with_introspection(
-                        slack_post_message_tool,
-                        {"channel_id": channel_id, "text": text_for_post}
-                    )
-                    last_timestamp = ts
+                # Ignore messages older than the most recent bot response.
+                if ts <= last_timestamp:
+                    continue
+
+                logger.info(f"New Slack message detected: {text}")
+                chat_result = await self.agent.chat(f"New Slack message: {text}")
+                # Convert the chat response and include the bot marker.
+                response_text = markdown_to_slack(chat_result['text'])
+                text_for_post = f"[BOT COMMENT]:\n{response_text}"
+                self.agent.call_tool_with_introspection(
+                    slack_post_message_tool,
+                    {"channel_id": channel_id, "text": text_for_post}
+                )
+                # Mark the message as processed by adding an "eyes" reaction.
+                reaction_return = self.agent.call_tool_with_introspection(
+                    slack_add_reaction_tool,
+                    {"channel_id": channel_id, "timestamp": msg.get("ts"), "reaction": "eyes"}
+                )
+                last_timestamp = ts
             await asyncio.sleep(10)
