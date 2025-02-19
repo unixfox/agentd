@@ -6,9 +6,15 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "appdirs>=1.4.4",
-    "astra-assistants>=2.3.7",
+    "astra-assistants>=2.4.1",
     "loguru>=0.7.3",
+    "textual>=2.0.4",
 ]
 
 [tool.uv.sources]
 astra-assistants = { path = "../astra-assistants-api/client" }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.4",
+]

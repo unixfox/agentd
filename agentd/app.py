@@ -7,7 +7,7 @@ from loguru import logger
 from datetime import datetime, timezone
 
 from config import ConfigManager
-from tools.done_tool import DoneTool
+from agentd.tools.done_tool import DoneTool
 from openai import OpenAI
 from astra_assistants import patch
 from astra_assistants.astra_assistants_manager import AssistantManager
@@ -23,7 +23,7 @@ class Agentd:
         self.instructions = instructions
 
         # Managers for conversation and supervision.
-        self.assistant_manager = None
+        self.assistant_manager: AssistantManager
         self.done_manager = None
 
         # State variables.
