@@ -64,12 +64,13 @@ class ThreadListScreen(Screen):
         table: DataTable = self.query_one("#thread-table", DataTable)
         table.clear(columns=True)
         # For example, display the thread id and creation time.
-        table.add_columns("ID", "Created At", "Metadata")
+        table.add_columns("ID", "Created At", "Metadata", "Last Message")
         for thread in threads_data:
             table.add_row(
                 thread.id,
                 str(thread.created_at),
-                str(thread.metadata) if thread.metadata is not None else "N/A"
+                str(thread.metadata) if thread.metadata is not None else "N/A",
+                str(thread.messages[0]) if len(thread.messages) else "N/A"
             )
         # Only shift focus if the search input is not active.
         search_input = self.query_one("#search-input", Input)
