@@ -25,7 +25,7 @@ class Agentd:
         self.config = config_manager.config
         self.instructions = instructions
 
-        self.assistant_manager: AssistantManager
+        self.assistant_manager: AssistantManager = None
         self.done_manager = None
 
         self.thread_id = None
@@ -43,9 +43,12 @@ class Agentd:
         self._init_managers(mcps)
 
     def _init_managers(self, mcps: MCPRepresentation):
-        self.thread_id = self.config.get("thread_id")
-        self.assistant_id = self.config.get("assistant_id")
+        # Retrieve persistent mapping of agent threads.
+        threads_map = self.config.get("agent_threads", {})
+        # Use saved "current_thread" if available.
+        self.thread_id = threads_map.get("current_thread")
 
+        self.assistant_id = self.config.get("assistant_id")
         client = patch(OpenAI())
         self.assistant_manager = AssistantManager(
             client=client,
@@ -58,6 +61,13 @@ class Agentd:
             self.config_manager.set("assistant_id", self.assistant_manager.assistant.id)
             self.assistant_id = self.assistant_manager.assistant.id
             logger.info(f"New assistant created with id: {self.assistant_id}")
+
+        # If thread_id is not set, use the assistant manager's thread id and save it.
+        if not self.thread_id:
+            self.thread_id = self.assistant_manager.thread.id
+            threads_map["current_thread"] = self.thread_id
+            self.config_manager.set("agent_threads", threads_map)
+            logger.info(f"Thread id set to: {self.thread_id}")
 
         self.cache_tools()
 
@@ -89,11 +99,9 @@ class Agentd:
         model_cls = tool.get_model()
         valid_fields = set(model_cls.model_fields.keys())
         valid_params = {k: v for k, v in provided_params.items() if k in valid_fields}
-
         for field_name, field_info in model_cls.model_fields.items():
             if field_info.is_required() and field_name not in valid_params:
                 raise ValueError(f"Missing required parameter: {field_name}")
-
         instance = model_cls(**valid_params)
         return tool.call(instance)
 
@@ -144,7 +152,7 @@ class Agentd:
                 new_doc_id = self.chat_result["text"].split(":")[2].split("/")[5]
                 logger.info(f"LLM requested new document creation: {new_doc_id}")
                 # Spawn a new agent instance for the new document.
-                asyncio.create_task(run_new_agent_instance(new_doc_id))
+                asyncio.create_task(run_agent_instance(new_doc_id))
         text = self.chat_result.get("text", "No text response found.")
         logger.info(f"Assistant response: {text}")
 
@@ -274,6 +282,12 @@ class Agentd:
         await self.chat(prompt="What tools do you have access to? Make sure you use them going forward.")
         self.thread_id = self.assistant_manager.thread.id
 
+        # Update persistent mapping: associate this thread with its doc_id.
+        threads_map = self.config.get("agent_threads", {})
+        threads_map[self.thread_id] = doc_id
+        threads_map["current_thread"] = self.thread_id
+        self.config_manager.set("agent_threads", threads_map)
+
         # Create modular subscriptions.
         subscriptions = []
         google_sub = GoogleDocSubscription(self, doc_id)
@@ -307,8 +321,9 @@ class Agentd:
         doc_id = result["output"].split(":")[2].split("/")[5]
         return doc_id
 
-# Helper to run a new agent instance using a given doc_id.
-async def run_new_agent_instance(new_doc_id: str):
+# Helper to run an agent instance.
+# If doc_id and thread_id are provided, re-instantiate that agent; otherwise, create a new document.
+async def run_agent_instance(doc_id: str = None, thread_id: str = None):
     instructions = (
         "You are a long running document writing agent. "
         "You will be notified of doc changes and comments. "
@@ -316,62 +331,7 @@ async def run_new_agent_instance(new_doc_id: str):
         "I will then automatically update the document using that content. "
         "When in doubt, ensure you are looking at the latest version of the doc. "
         "Don't use any markdown in the google doc. "
-        "Always include URLs in your citations when referencing content from search tools."
-    )
-    config_manager = ConfigManager(app_name="agentd", app_author="phact")
-    brave_key = os.environ['BRAVE_API_KEY']
-    mcps = [
-        MCPRepresentationStdio(
-            type="stdio",
-            command="uv",
-            arguments=[
-                "run",
-                "--refresh",
-                "--with",
-                "../mcp-google-docs",
-                "server",
-                "--creds-file-path",
-                "../mcp-google-docs/.auth/client_secret_1049158366095-o78hnepquu77t0uf3gr7q5ik887a6tvv.apps.googleusercontent.com.json",
-                "--token-path",
-                "../mcp-google-docs/.auth/token",
-            ],
-            tool_filter=['read-doc', 'create-doc']
-        ),
-        MCPRepresentationStdio(
-            type="stdio",
-            command="npx",
-            arguments=["-y", "@modelcontextprotocol/server-brave-search"],
-            env_vars=[f"BRAVE_API_KEY={brave_key}"]
-        ),
-        MCPRepresentationStdio(
-            type="stdio",
-            command="uv",
-            arguments=["run", "--refresh", "--with", "mcp_simple_arxiv", "mcp-simple-arxiv"],
-        ),
-        MCPRepresentationStdio(
-            type="stdio",
-            command="npx",
-            arguments=["-y", "@modelcontextprotocol/server-slack"],
-            env_vars=[
-                f"SLACK_BOT_TOKEN={os.environ['SLACK_BOT_TOKEN']}",
-                f"SLACK_TEAM_ID={os.environ['SLACK_TEAM_ID']}",
-            ]
-        )
-    ]
-    new_agent = Agentd(instructions, config_manager, mcps)
-    logger.info(f"Starting new agent instance with doc: {new_doc_id}")
-    await new_agent.run(new_doc_id)
-
-# This function creates an initial agent instance by having the agent create its own document.
-async def run_agent_instance():
-    instructions = (
-        "You are a long running document writing agent. "
-        "You will be notified of doc changes and comments. "
-        "When you want to update the document, please enclose your new content in triple backticks (```your content```). "
-        "I will then automatically update the document using that content. "
-        "When in doubt, ensure you are looking at the latest version of the doc. "
-        "Don't use any markdown in the google doc. "
-        "Always include URLs in your citations when referencing content from search tools."
+        "Always include URLs in your citations when referencing content from search tools. "
         "When you create documents make sure to share them with datastax.com. "
     )
     config_manager = ConfigManager(app_name="agentd", app_author="phact")
@@ -415,12 +375,29 @@ async def run_agent_instance():
         )
     ]
     agent = Agentd(instructions, config_manager, mcps)
-    doc_id = await agent.create_doc()
-    logger.info(f"New document created: {doc_id}")
+    # Override thread_id if provided.
+    if thread_id:
+        agent.thread_id = thread_id
+    # Create a new document if doc_id not provided.
+    if not doc_id:
+        doc_id = await agent.create_doc()
+        logger.info(f"New document created: {doc_id}")
+    logger.info(f"Starting agent instance with doc: {doc_id} and thread: {agent.thread_id}")
     await agent.run(doc_id)
 
+# Startup routine.
 async def main():
-    await run_agent_instance()
+    config_manager = ConfigManager(app_name="agentd", app_author="phact")
+    agents_map = config_manager.config.get("agent_threads", {})
+    tasks = []
+    # Re-instantiate agents from saved mapping (skip reserved keys like "current_thread").
+    for key, doc in agents_map.items():
+        if key == "current_thread":
+            continue
+        tasks.append(asyncio.create_task(run_agent_instance(doc_id=doc, thread_id=key)))
+    if not tasks:
+        tasks.append(asyncio.create_task(run_agent_instance()))
+    await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
     asyncio.run(main())
