@@ -40,7 +40,7 @@ class AugmentedThread(BaseModel):
     `code_interpreter` tool requires a list of file IDs, while the `file_search`
     tool requires a list of vector store IDs.
     """
-    messages: list[str]
+    messages: list[Message]
     """
     A list of [messages](https://platform.openai.com/docs/api-reference/messages).
     """
@@ -49,20 +49,26 @@ def list_messages(manager: AssistantManager, thread_id: str):
     """
     Retrieve the messages for a given thread by its ID.
     """
-    return manager.client.beta.threads.messages.list(thread_id)
+    try:
+        return manager.client.beta.threads.messages.list(thread_id).data
+    except Exception as e:
+        print(e)
 
 def get_thread_with_messages(manager: AssistantManager, raw_thread) -> AugmentedThread:
     """
     Retrieve messages for a given raw_thread and return an AugmentedThread instance.
     """
-    # Assumes raw_thread has an 'id' attribute and a to_dict() method.
-    messages = list_messages(manager, raw_thread.id).data
-    if messages:
-        print(messages)
-    return AugmentedThread(
-        **raw_thread.to_dict(),
-        messages=messages
-    )
+    try:
+        messages = list_messages(manager, raw_thread.id)
+        if messages:
+            print(messages)
+        thread = AugmentedThread(
+            **raw_thread.to_dict(),
+            messages=messages
+        )
+    except Exception as e:
+        raise e
+    return thread
 
 def list_threads(manager: AssistantManager):
     """

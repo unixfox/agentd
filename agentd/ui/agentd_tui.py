@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import DataTable, Header, Footer, Input, Static
@@ -10,6 +12,14 @@ from textual.message import Message
 from astra_assistants.astra_assistants_manager import AssistantManager
 
 from agentd.ui.assistant_util import create_manager, list_threads, list_messages
+
+import logging
+
+logging.basicConfig(
+    filename="agentd_tui.log",     # Log file name.
+    level=logging.DEBUG,           # Capture debug and higher level messages.
+    format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
+)
 
 
 # Define a custom message to signal that a thread should be opened.
@@ -38,6 +48,15 @@ class ThreadListScreen(Screen):
         ("l", "open_thread", "Open thread")
     ]
 
+    def __init__(
+            self,
+            name: str | None = None,
+            id: str | None = None,
+            classes: str | None = None,
+    ):
+        super().__init__(name, id, classes)
+        self.all_threads = None
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Input(placeholder="Search threads...", id="search-input")
@@ -61,18 +80,27 @@ class ThreadListScreen(Screen):
         self.load_table(self.all_threads)
 
     def load_table(self, threads_data):
+        # Sort threads by created_at in descending order (most recent first)
+        sorted_threads = sorted(threads_data, key=lambda thread: thread.created_at, reverse=True)
+
         table: DataTable = self.query_one("#thread-table", DataTable)
         table.clear(columns=True)
-        # For example, display the thread id and creation time.
-        table.add_columns("ID", "Created At", "Metadata", "Last Message")
-        for thread in threads_data:
+        table.add_columns("ID", "Created At", "Metadata", "Last Message", "Assistant ID", "Role", "Run ID", "Status", "Message ID")
+
+        for thread in sorted_threads:
+            logging.debug(thread)
             table.add_row(
                 thread.id,
-                str(thread.created_at),
+                str(datetime.fromtimestamp(thread.created_at/1000)),
                 str(thread.metadata) if thread.metadata is not None else "N/A",
-                str(thread.messages[0]) if len(thread.messages) else "N/A"
+                str(thread.messages[0].content[0].text.value) if thread.messages and len(thread.messages) else "N/A",
+                str(thread.messages[0].assistant_id) if len(thread.messages) else "N/A",
+                str(thread.messages[0].role) if len(thread.messages) else "N/A",
+                str(thread.messages[0].run_id) if len(thread.messages) else "N/A",
+                str(thread.messages[0].status) if len(thread.messages) else "N/A",
+                str(thread.messages[0].id) if len(thread.messages) else "N/A"
             )
-        # Only shift focus if the search input is not active.
+
         search_input = self.query_one("#search-input", Input)
         if not search_input.has_focus:
             table.focus()
@@ -143,9 +171,10 @@ class ThreadDetailScreen(Screen):
     def format_messages(self) -> str:
         # Assume that the thread model now has an attribute "messages" (a list)
         messages = getattr(self.thread_data, "messages", [])
+        logging.debug("Retrieved messages: %s", messages)
         if messages:
             # If messages are objects, access their attributes (adjust as needed)
-            return "\n".join(f"[{msg.sender}] {msg.message}" for msg in messages)
+            return "\n".join(f"[{msg.role}] {msg.content[0].text.value}" for msg in messages)
         return "No messages yet."
 
     async def on_mount(self) -> None:
@@ -157,23 +186,23 @@ class ThreadDetailScreen(Screen):
         messages_widget: Static = self.query_one("#messages-content", Static)
         messages_widget.update(self.format_messages())
 
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "chat-input":
-            user_input = event.value
-            # Append the user's message.
-            if not hasattr(self.thread_data, "messages") or self.thread_data.messages is None:
-                self.thread_data.messages = []
-            self.thread_data.messages.append({"sender": "User", "message": user_input})
-            # Simulate an assistant reply.
-            assistant_reply = f"Assistant reply to: {user_input}"
-            self.thread_data.messages.append({"sender": "Assistant", "message": assistant_reply})
-            # Update the child Static widget.
-            messages_widget: Static = self.query_one("#messages-content", Static)
-            messages_widget.update(self.format_messages())
-            # Optionally, scroll to the end.
-            scroll_view = self.query_one("#thread-messages", ScrollView)
-            scroll_view.scroll_end()
-            event.input.value = ""
+    #async def on_input_submitted(self, event: Input.Submitted) -> None:
+    #    if event.input.id == "chat-input":
+    #        user_input = event.value
+    #        # Append the user's message.
+    #        if not hasattr(self.thread_data, "messages") or self.thread_data.messages is None:
+    #            self.thread_data.messages = []
+    #        self.thread_data.messages.append({"sender": "User", "message": user_input})
+    #        # Simulate an assistant reply.
+    #        assistant_reply = f"Assistant reply to: {user_input}"
+    #        self.thread_data.messages.append({"sender": "Assistant", "message": assistant_reply})
+    #        # Update the child Static widget.
+    #        messages_widget: Static = self.query_one("#messages-content", Static)
+    #        messages_widget.update(self.format_messages())
+    #        # Optionally, scroll to the end.
+    #        scroll_view = self.query_one("#thread-messages", ScrollView)
+    #        scroll_view.scroll_end()
+    #        event.input.value = ""
 
     def action_scroll_down(self) -> None:
         scroll_view: ScrollView = self.query_one("#thread-messages", ScrollView)
