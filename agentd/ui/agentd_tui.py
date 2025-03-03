@@ -1,8 +1,7 @@
 from datetime import datetime
-
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import DataTable, Header, Footer, Input, Static
+from textual.widgets import DataTable, Header, Footer, Input
 from textual.scroll_view import ScrollView
 from textual.screen import Screen
 from textual import events
@@ -10,52 +9,41 @@ from textual.message import Message
 
 # Import your AssistantManager from your library.
 from astra_assistants.astra_assistants_manager import AssistantManager
-
 from agentd.ui.assistant_util import create_manager, list_threads, list_messages
 
 import logging
 
 logging.basicConfig(
-    filename="agentd_tui.log",     # Log file name.
-    level=logging.DEBUG,           # Capture debug and higher level messages.
+    filename="agentd_tui.log",
+    level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
 )
 
-
-# Define a custom message to signal that a thread should be opened.
 class ThreadOpenRequest(Message):
     def __init__(self, row_index: int) -> None:
         self.row_index = row_index
         super().__init__()
 
-# Subclass DataTable to override its default behavior.
 class MyDataTable(DataTable):
     def action_select_cursor(self) -> None:
-        # Override default behavior so that Enter does not select the cell.
         pass
 
     def key_enter(self) -> None:
-        # When Enter is pressed, post a message with the current cursor row.
         self.post_message(ThreadOpenRequest(self.cursor_row))
 
-
 class ThreadListScreen(Screen):
-    """Screen to display a searchable list of threads in a DataTable."""
     BINDINGS = [
         ("j", "table_down", "Move down"),
         ("k", "table_up", "Move up"),
         ("/", "focus_search", "Focus search"),
-        ("l", "open_thread", "Open thread")
+        ("l", "open_thread", "Open thread"),
+        ("w", "toggle_wrap", "Toggle text wrap")
     ]
 
-    def __init__(
-            self,
-            name: str | None = None,
-            id: str | None = None,
-            classes: str | None = None,
-    ):
+    def __init__(self, name: str | None = None, id: str | None = None, classes: str | None = None):
         super().__init__(name, id, classes)
         self.all_threads = None
+        self.wrap_text = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -64,7 +52,6 @@ class ThreadListScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-       # Initialize the assistant manager with your actual instructions.
         self.assistant_manager = create_manager(
             instructions="Your assistant instructions go here",
             model="gpt-4o"
@@ -74,22 +61,19 @@ class ThreadListScreen(Screen):
             if not threads:
                 raise Exception("No threads found.")
         except Exception as e:
-            # Fallback: use the single thread from the manager.
             threads = [self.assistant_manager.thread]
         self.all_threads = threads
         self.load_table(self.all_threads)
 
     def load_table(self, threads_data):
-        # Sort threads by created_at in descending order (most recent first)
         sorted_threads = sorted(threads_data, key=lambda thread: thread.created_at, reverse=True)
-
         table: DataTable = self.query_one("#thread-table", DataTable)
         table.clear(columns=True)
-        table.add_columns("ID", "Created At", "Metadata", "Last Message", "Assistant ID", "Role", "Run ID", "Status", "Message ID")
+        columns = ["ID", "Created At", "Metadata", "Last Message", "Assistant ID", "Role", "Run ID", "Status", "Message ID"]
+        table.add_columns(*columns)
 
         for thread in sorted_threads:
-            logging.debug(thread)
-            table.add_row(
+            row_data = [
                 thread.id,
                 str(datetime.fromtimestamp(thread.created_at/1000)),
                 str(thread.metadata) if thread.metadata is not None else "N/A",
@@ -99,11 +83,28 @@ class ThreadListScreen(Screen):
                 str(thread.messages[0].run_id) if len(thread.messages) else "N/A",
                 str(thread.messages[0].status) if len(thread.messages) else "N/A",
                 str(thread.messages[0].id) if len(thread.messages) else "N/A"
-            )
+            ]
+            table.add_row(*row_data)
 
+        self.update_table_wrapping(table)
         search_input = self.query_one("#search-input", Input)
         if not search_input.has_focus:
             table.focus()
+
+    def update_table_wrapping(self, table: DataTable):
+        """Update table column widths based on wrap_text state, checking column existence."""
+        column_count = len(table.columns)
+        if self.wrap_text:
+            if 3 in table.columns:  # "Last Message"
+                table.columns[3]._width = None
+            if 2 in table.columns:  # "Metadata"
+                table.columns[2]._width = None
+        else:
+            if 3 in table.columns:  # "Last Message"
+                table.columns[3]._width = 30
+            if 2 in table.columns:  # "Metadata"
+                table.columns[2]._width = 20
+        table.refresh()
 
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "search-input":
@@ -131,102 +132,124 @@ class ThreadListScreen(Screen):
         search_input = self.query_one("#search-input", Input)
         search_input.focus()
 
+    def action_toggle_wrap(self) -> None:
+        self.wrap_text = not self.wrap_text
+        table: DataTable = self.query_one("#thread-table", DataTable)
+        self.update_table_wrapping(table)
+
     async def action_open_thread(self) -> None:
         table: DataTable = self.query_one("#thread-table", DataTable)
         row_index = table.cursor_row
         if row_index is not None:
             row_data = table.get_row_at(row_index)
             thread_id = row_data[0]
-            # Since thread is a Pydantic model, compare using attribute access.
             thread = next((t for t in self.all_threads if t.id == thread_id), None)
             if thread:
-                # Pass the assistant manager to the detail screen.
                 await self.app.push_screen(ThreadDetailScreen(thread, manager=self.assistant_manager))
 
     async def on_thread_open_request(self, message: ThreadOpenRequest) -> None:
         await self.action_open_thread()
 
-
 class ThreadDetailScreen(Screen):
-    """Screen to display messages for a selected thread with live scrolling chat."""
     BINDINGS = [
         ("q", "pop_screen", "Back"),
-        ("j", "scroll_down", "Scroll Down"),
-        ("k", "scroll_up", "Scroll Up")
+        ("escape", "pop_screen", "Back"),
+        ("j", "table_down", "Move down"),
+        ("k", "table_up", "Move up"),
+        ("/", "focus_search", "Focus search"),
+        ("w", "toggle_wrap", "Toggle text wrap")
     ]
 
     def __init__(self, thread_data, manager, **kwargs):
         super().__init__(**kwargs)
-        self.thread_data = thread_data  # A Pydantic model instance.
-        self.manager = manager          # AssistantManager instance.
+        self.thread_data = thread_data
+        self.manager = manager
+        self.all_messages = []
+        self.wrap_text = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Static(f"Thread: {self.thread_data.id}", id="thread-header")
-        # Create a ScrollView that contains a Static widget (the actual log)
-        yield ScrollView(Static(self.format_messages(), id="messages-content"), id="thread-messages")
-        yield Input(placeholder="Type your message here...", id="chat-input")
+        yield Input(placeholder="Search messages or type your message here...", id="search-input")
+        yield ScrollView(MyDataTable(id="messages-table"), id="thread-messages")
         yield Footer()
 
-    def format_messages(self) -> str:
-        # Assume that the thread model now has an attribute "messages" (a list)
-        messages = getattr(self.thread_data, "messages", [])
-        logging.debug("Retrieved messages: %s", messages)
-        if messages:
-            # If messages are objects, access their attributes (adjust as needed)
-            return "\n".join(f"[{msg.role}] {msg.content[0].text.value}" for msg in messages)
-        return "No messages yet."
+    def load_messages(self, messages=None):
+        if messages is None:
+            messages = self.all_messages
+        sorted_messages = sorted(messages, key=lambda msg: getattr(msg, 'created_at', 0))
+        table: DataTable = self.query_one("#messages-table", DataTable)
+        table.clear(columns=True)
+        table.add_columns("Role", "Message")
+        for msg in sorted_messages:
+            table.add_row(
+                msg.role,
+                msg.content[0].text.value if msg.content else "N/A"
+            )
+        scroll_view: ScrollView = self.query_one("#thread-messages", ScrollView)
+        scroll_view.scroll_to(y=scroll_view.virtual_size.height, animate=False)
+        self.update_table_wrapping(table)
+        if not self.query_one("#search-input", Input).has_focus:
+            table.focus()
+
+    def update_table_wrapping(self, table: DataTable):
+        """Update table column widths based on wrap_text state, checking column existence."""
+        if self.wrap_text:
+            if 1 in table.columns:  # "Message"
+                table.columns[1]._width = None
+        else:
+            if 1 in table.columns:  # "Message"
+                table.columns[1]._width = 50
+        table.refresh()
 
     async def on_mount(self) -> None:
-        # Retrieve messages for this thread via the API.
         messages = list_messages(self.manager, self.thread_data.id)
-        # Update the thread model with these messages.
         self.thread_data.messages = messages
-        # Instead of calling update() on the ScrollView, update its child Static widget.
-        messages_widget: Static = self.query_one("#messages-content", Static)
-        messages_widget.update(self.format_messages())
+        self.all_messages = messages
+        self.load_messages()
 
-    #async def on_input_submitted(self, event: Input.Submitted) -> None:
-    #    if event.input.id == "chat-input":
-    #        user_input = event.value
-    #        # Append the user's message.
-    #        if not hasattr(self.thread_data, "messages") or self.thread_data.messages is None:
-    #            self.thread_data.messages = []
-    #        self.thread_data.messages.append({"sender": "User", "message": user_input})
-    #        # Simulate an assistant reply.
-    #        assistant_reply = f"Assistant reply to: {user_input}"
-    #        self.thread_data.messages.append({"sender": "Assistant", "message": assistant_reply})
-    #        # Update the child Static widget.
-    #        messages_widget: Static = self.query_one("#messages-content", Static)
-    #        messages_widget.update(self.format_messages())
-    #        # Optionally, scroll to the end.
-    #        scroll_view = self.query_one("#thread-messages", ScrollView)
-    #        scroll_view.scroll_end()
-    #        event.input.value = ""
+    async def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "search-input":
+            query = event.value.lower()
+            filtered_messages = [
+                msg for msg in self.all_messages
+                if query in msg.role.lower() or (msg.content and query in msg.content[0].text.value.lower())
+            ]
+            self.load_messages(filtered_messages)
 
-    def action_scroll_down(self) -> None:
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "search-input":
+            table: DataTable = self.query_one("#messages-table", DataTable)
+            table.focus()
+
+    def action_table_down(self) -> None:
+        table: DataTable = self.query_one("#messages-table", DataTable)
+        table.action_cursor_down()
         scroll_view: ScrollView = self.query_one("#thread-messages", ScrollView)
-        scroll_view.scroll_to(y=scroll_view.virtual_size.height, animate=True)
+        cursor_y = table.cursor_coordinate.row
+        scroll_view.scroll_to(y=cursor_y, animate=True)
 
-    def action_scroll_up(self) -> None:
+    def action_table_up(self) -> None:
+        table: DataTable = self.query_one("#messages-table", DataTable)
+        table.action_cursor_up()
         scroll_view: ScrollView = self.query_one("#thread-messages", ScrollView)
-        scroll_view.scroll_to(y=0, animate=True)
+        cursor_y = table.cursor_coordinate.row
+        scroll_view.scroll_to(y=cursor_y, animate=True)
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
 
-    async def on_key(self, event: events.Key) -> None:
-        if event.key in ("down", "j"):
-            self.action_scroll_down()
-        elif event.key in ("up", "k"):
-            self.action_scroll_up()
+    def action_focus_search(self) -> None:
+        search_input = self.query_one("#search-input", Input)
+        search_input.focus()
 
+    def action_toggle_wrap(self) -> None:
+        self.wrap_text = not self.wrap_text
+        table: DataTable = self.query_one("#messages-table", DataTable)
+        self.update_table_wrapping(table)
 
 class AssistantTUI(App):
-    """Main Textual Application for the assistant TUI."""
     def on_mount(self) -> None:
         self.push_screen(ThreadListScreen())
-
 
 if __name__ == "__main__":
     AssistantTUI().run()
