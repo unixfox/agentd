@@ -93,27 +93,27 @@ class ThreadListScreen(Screen):
 
     def update_table_wrapping(self, table: DataTable):
         """Update table column widths based on wrap_text state, checking column existence."""
-        column_count = len(table.columns)
-        if self.wrap_text:
-            if 3 in table.columns:  # "Last Message"
-                table.columns[3]._width = None
-            if 2 in table.columns:  # "Metadata"
-                table.columns[2]._width = None
-        else:
-            if 3 in table.columns:  # "Last Message"
-                table.columns[3]._width = 30
-            if 2 in table.columns:  # "Metadata"
-                table.columns[2]._width = 20
+        if 3 in table.columns:  # "Last Message"
+            table.columns[3]._width = None if self.wrap_text else 30
+        if 2 in table.columns:  # "Metadata"
+            table.columns[2]._width = None if self.wrap_text else 20
         table.refresh()
 
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "search-input":
             query = event.value.lower()
-            filtered_threads = [
-                t for t in self.all_threads
-                if query in t.id.lower() or query in str(t.created_at).lower() or (t.metadata and query in str(t.metadata).lower())
-            ]
-            self.load_table(filtered_threads)
+            if not query:
+                # If search is cleared, show all threads
+                self.load_table(self.all_threads)
+            else:
+                filtered_threads = [
+                    t for t in self.all_threads
+                    if query in t.id.lower() or
+                       query in str(t.created_at).lower() or
+                       (t.metadata and query in str(t.metadata).lower()) or
+                       (t.messages and len(t.messages) and query in str(t.messages[0].content[0].text.value).lower())
+                ]
+                self.load_table(filtered_threads)
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "search-input":
@@ -193,12 +193,8 @@ class ThreadDetailScreen(Screen):
 
     def update_table_wrapping(self, table: DataTable):
         """Update table column widths based on wrap_text state, checking column existence."""
-        if self.wrap_text:
-            if 1 in table.columns:  # "Message"
-                table.columns[1]._width = None
-        else:
-            if 1 in table.columns:  # "Message"
-                table.columns[1]._width = 50
+        if 1 in table.columns:  # "Message"
+            table.columns[1]._width = None if self.wrap_text else 50
         table.refresh()
 
     async def on_mount(self) -> None:
@@ -210,11 +206,16 @@ class ThreadDetailScreen(Screen):
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "search-input":
             query = event.value.lower()
-            filtered_messages = [
-                msg for msg in self.all_messages
-                if query in msg.role.lower() or (msg.content and query in msg.content[0].text.value.lower())
-            ]
-            self.load_messages(filtered_messages)
+            if not query:
+                # If search is cleared, show all messages
+                self.load_messages(self.all_messages)
+            else:
+                filtered_messages = [
+                    msg for msg in self.all_messages
+                    if query in msg.role.lower() or
+                       (msg.content and query in msg.content[0].text.value.lower())
+                ]
+                self.load_messages(filtered_messages)
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "search-input":
