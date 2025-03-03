@@ -31,6 +31,29 @@ class MyDataTable(DataTable):
     def key_enter(self) -> None:
         self.post_message(ThreadOpenRequest(self.cursor_row))
 
+def split_text(text, max_length):
+    """Split text into chunks of max_length, preserving words where possible."""
+    if len(text) <= max_length:
+        return [text]
+    words = text.split()
+    lines = []
+    current_line = ""
+    for word in words:
+        if len(current_line) + len(word) + 1 <= max_length:
+            current_line += (" " + word if current_line else word)
+        else:
+            if current_line:
+                lines.append(current_line)
+            if len(word) > max_length:
+                while word:
+                    lines.append(word[:max_length])
+                    word = word[max_length:]
+            else:
+                current_line = word
+    if current_line:
+        lines.append(current_line)
+    return lines
+
 class ThreadListScreen(Screen):
     BINDINGS = [
         ("j", "table_down", "Move down"),
@@ -44,6 +67,7 @@ class ThreadListScreen(Screen):
         super().__init__(name, id, classes)
         self.all_threads = None
         self.wrap_text = False
+        self.thread_data_cache = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -68,42 +92,91 @@ class ThreadListScreen(Screen):
     def load_table(self, threads_data):
         sorted_threads = sorted(threads_data, key=lambda thread: thread.created_at, reverse=True)
         table: DataTable = self.query_one("#thread-table", DataTable)
-        table.clear(columns=True)
+        table.clear(columns=True)  # Only clear columns once during initial load
         columns = ["ID", "Created At", "Metadata", "Last Message", "Assistant ID", "Role", "Run ID", "Status", "Message ID"]
         table.add_columns(*columns)
 
+        self.thread_data_cache = []
         for thread in sorted_threads:
-            row_data = [
-                thread.id,
-                str(datetime.fromtimestamp(thread.created_at/1000)),
-                str(thread.metadata) if thread.metadata is not None else "N/A",
-                str(thread.messages[0].content[0].text.value) if thread.messages and len(thread.messages) else "N/A",
-                str(thread.messages[0].assistant_id) if len(thread.messages) else "N/A",
-                str(thread.messages[0].role) if len(thread.messages) else "N/A",
-                str(thread.messages[0].run_id) if len(thread.messages) else "N/A",
-                str(thread.messages[0].status) if len(thread.messages) else "N/A",
-                str(thread.messages[0].id) if len(thread.messages) else "N/A"
-            ]
-            table.add_row(*row_data)
+            full_metadata = str(thread.metadata) if thread.metadata is not None else "N/A"
+            full_last_message = str(thread.messages[0].content[0].text.value) if thread.messages and len(thread.messages) else "N/A"
+            if self.wrap_text:
+                metadata_lines = split_text(full_metadata, 20)
+                message_lines = split_text(full_last_message, 30)
+                max_lines = max(len(metadata_lines), len(message_lines))
+                for i in range(max_lines):
+                    row_data = [
+                        thread.id if i == 0 else "",
+                        str(datetime.fromtimestamp(thread.created_at/1000)) if i == 0 else "",
+                        metadata_lines[i] if i < len(metadata_lines) else "",
+                        message_lines[i] if i < len(message_lines) else "",
+                        str(thread.messages[0].assistant_id) if i == 0 and len(thread.messages) else "" if i == 0 else "",
+                        str(thread.messages[0].role) if i == 0 and len(thread.messages) else "" if i == 0 else "",
+                        str(thread.messages[0].run_id) if i == 0 and len(thread.messages) else "" if i == 0 else "",
+                        str(thread.messages[0].status) if i == 0 and len(thread.messages) else "" if i == 0 else "",
+                        str(thread.messages[0].id) if i == 0 and len(thread.messages) else "" if i == 0 else ""
+                    ]
+                    table.add_row(*row_data)
+            else:
+                row_data = [
+                    thread.id,
+                    str(datetime.fromtimestamp(thread.created_at/1000)),
+                    full_metadata[:20] + "..." if len(full_metadata) > 20 else full_metadata,
+                    full_last_message[:30] + "..." if len(full_last_message) > 30 else full_last_message,
+                    str(thread.messages[0].assistant_id) if len(thread.messages) else "N/A",
+                    str(thread.messages[0].role) if len(thread.messages) else "N/A",
+                    str(thread.messages[0].run_id) if len(thread.messages) else "N/A",
+                    str(thread.messages[0].status) if len(thread.messages) else "N/A",
+                    str(thread.messages[0].id) if len(thread.messages) else "N/A"
+                ]
+                table.add_row(*row_data)
+            self.thread_data_cache.append((thread, full_metadata, full_last_message))
 
-        self.update_table_wrapping(table)
         search_input = self.query_one("#search-input", Input)
         if not search_input.has_focus:
             table.focus()
 
-    def update_table_wrapping(self, table: DataTable):
-        """Update table column widths based on wrap_text state, checking column existence."""
-        if 3 in table.columns:  # "Last Message"
-            table.columns[3]._width = None if self.wrap_text else 30
-        if 2 in table.columns:  # "Metadata"
-            table.columns[2]._width = None if self.wrap_text else 20
+    def update_table_wrapping(self):
+        table: DataTable = self.query_one("#thread-table", DataTable)
+        table.clear(columns=False)  # Clear rows only, preserve columns
+
+        for thread, full_metadata, full_last_message in self.thread_data_cache:
+            if self.wrap_text:
+                metadata_lines = split_text(full_metadata, 20)
+                message_lines = split_text(full_last_message, 30)
+                max_lines = max(len(metadata_lines), len(message_lines))
+                for i in range(max_lines):
+                    row_data = [
+                        thread.id if i == 0 else "",
+                        str(datetime.fromtimestamp(thread.created_at/1000)) if i == 0 else "",
+                        metadata_lines[i] if i < len(metadata_lines) else "",
+                        message_lines[i] if i < len(message_lines) else "",
+                        str(thread.messages[0].assistant_id) if i == 0 and len(thread.messages) else "" if i == 0 else "",
+                        str(thread.messages[0].role) if i == 0 and len(thread.messages) else "" if i == 0 else "",
+                        str(thread.messages[0].run_id) if i == 0 and len(thread.messages) else "" if i == 0 else "",
+                        str(thread.messages[0].status) if i == 0 and len(thread.messages) else "" if i == 0 else "",
+                        str(thread.messages[0].id) if i == 0 and len(thread.messages) else "" if i == 0 else ""
+                    ]
+                    table.add_row(*row_data)
+            else:
+                row_data = [
+                    thread.id,
+                    str(datetime.fromtimestamp(thread.created_at/1000)),
+                    full_metadata[:20] + "..." if len(full_metadata) > 20 else full_metadata,
+                    full_last_message[:30] + "..." if len(full_last_message) > 30 else full_last_message,
+                    str(thread.messages[0].assistant_id) if len(thread.messages) else "N/A",
+                    str(thread.messages[0].role) if len(thread.messages) else "N/A",
+                    str(thread.messages[0].run_id) if len(thread.messages) else "N/A",
+                    str(thread.messages[0].status) if len(thread.messages) else "N/A",
+                    str(thread.messages[0].id) if len(thread.messages) else "N/A"
+                ]
+                table.add_row(*row_data)
         table.refresh()
 
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "search-input":
             query = event.value.lower()
             if not query:
-                # If search is cleared, show all threads
                 self.load_table(self.all_threads)
             else:
                 filtered_threads = [
@@ -134,8 +207,7 @@ class ThreadListScreen(Screen):
 
     def action_toggle_wrap(self) -> None:
         self.wrap_text = not self.wrap_text
-        table: DataTable = self.query_one("#thread-table", DataTable)
-        self.update_table_wrapping(table)
+        self.update_table_wrapping()
 
     async def action_open_thread(self) -> None:
         table: DataTable = self.query_one("#thread-table", DataTable)
@@ -166,6 +238,7 @@ class ThreadDetailScreen(Screen):
         self.manager = manager
         self.all_messages = []
         self.wrap_text = False
+        self.message_data_cache = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -178,23 +251,55 @@ class ThreadDetailScreen(Screen):
             messages = self.all_messages
         sorted_messages = sorted(messages, key=lambda msg: getattr(msg, 'created_at', 0))
         table: DataTable = self.query_one("#messages-table", DataTable)
-        table.clear(columns=True)
+        table.clear(columns=True)  # Only clear columns once during initial load
         table.add_columns("Role", "Message")
+
+        self.message_data_cache = []
         for msg in sorted_messages:
-            table.add_row(
-                msg.role,
-                msg.content[0].text.value if msg.content else "N/A"
-            )
+            full_message = msg.content[0].text.value if msg.content else "N/A"
+            if self.wrap_text:
+                message_lines = split_text(full_message, 50)
+                for i, line in enumerate(message_lines):
+                    row_data = [
+                        msg.role if i == 0 else "",
+                        line
+                    ]
+                    table.add_row(*row_data)
+            else:
+                row_data = [
+                    msg.role,
+                    full_message[:50] + "..." if len(full_message) > 50 else full_message
+                ]
+                table.add_row(*row_data)
+            self.message_data_cache.append((msg, full_message))
+
         scroll_view: ScrollView = self.query_one("#thread-messages", ScrollView)
         scroll_view.scroll_to(y=scroll_view.virtual_size.height, animate=False)
-        self.update_table_wrapping(table)
         if not self.query_one("#search-input", Input).has_focus:
             table.focus()
 
-    def update_table_wrapping(self, table: DataTable):
-        """Update table column widths based on wrap_text state, checking column existence."""
-        if 1 in table.columns:  # "Message"
-            table.columns[1]._width = None if self.wrap_text else 50
+    def update_table_wrapping(self):
+        table: DataTable = self.query_one("#messages-table", DataTable)
+        table.clear(columns=False)  # Clear rows only, preserve columns
+
+        for msg, full_message in self.message_data_cache:
+            if self.wrap_text:
+                message_lines = split_text(full_message, 50)
+                for i, line in enumerate(message_lines):
+                    row_data = [
+                        msg.role if i == 0 else "",
+                        line
+                    ]
+                    table.add_row(*row_data)
+            else:
+                row_data = [
+                    msg.role,
+                    full_message[:50] + "..." if len(full_message) > 50 else full_message
+                ]
+                table.add_row(*row_data)
+
+        scroll_view: ScrollView = self.query_one("#thread-messages", ScrollView)
+        scroll_view.scroll_to(y=scroll_view.virtual_size.height, animate=False)
         table.refresh()
 
     async def on_mount(self) -> None:
@@ -207,7 +312,6 @@ class ThreadDetailScreen(Screen):
         if event.input.id == "search-input":
             query = event.value.lower()
             if not query:
-                # If search is cleared, show all messages
                 self.load_messages(self.all_messages)
             else:
                 filtered_messages = [
@@ -245,8 +349,7 @@ class ThreadDetailScreen(Screen):
 
     def action_toggle_wrap(self) -> None:
         self.wrap_text = not self.wrap_text
-        table: DataTable = self.query_one("#messages-table", DataTable)
-        self.update_table_wrapping(table)
+        self.update_table_wrapping()
 
 class AssistantTUI(App):
     def on_mount(self) -> None:
