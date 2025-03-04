@@ -6,13 +6,10 @@ from textual.scroll_view import ScrollView
 from textual.screen import Screen
 from textual import events
 from textual.message import Message
-
 # Import your AssistantManager from your library.
 from astra_assistants.astra_assistants_manager import AssistantManager
 from agentd.ui.assistant_util import create_manager, list_threads, list_messages
-
 import logging
-
 logging.basicConfig(
     filename="agentd_tui.log",
     level=logging.DEBUG,
@@ -55,13 +52,15 @@ def split_text(text, max_length):
     return lines
 
 class ThreadListScreen(Screen):
-    BINDINGS = [
+    BINDINGS = (
         ("j", "table_down", "Move down"),
         ("k", "table_up", "Move up"),
         ("/", "focus_search", "Focus search"),
         ("l", "open_thread", "Open thread"),
-        ("w", "toggle_wrap", "Toggle text wrap")
-    ]
+        ("w", "toggle_wrap", "Toggle text wrap"),
+        ("G", "scroll_to_bottom", "Scroll to bottom"),  # Shift+G
+        ("g g", "scroll_to_top", "Scroll to top")      # gg
+    )
 
     def __init__(self, name: str | None = None, id: str | None = None, classes: str | None = None):
         super().__init__(name, id, classes)
@@ -85,6 +84,7 @@ class ThreadListScreen(Screen):
             if not threads:
                 raise Exception("No threads found.")
         except Exception as e:
+            logging.error(f"Error fetching threads: {e}")
             threads = [self.assistant_manager.thread]
         self.all_threads = threads
         self.load_table(self.all_threads)
@@ -92,10 +92,9 @@ class ThreadListScreen(Screen):
     def load_table(self, threads_data):
         sorted_threads = sorted(threads_data, key=lambda thread: thread.created_at, reverse=True)
         table: DataTable = self.query_one("#thread-table", DataTable)
-        table.clear(columns=True)  # Only clear columns once during initial load
+        table.clear(columns=True)
         columns = ["ID", "Created At", "Metadata", "Last Message", "Assistant ID", "Role", "Run ID", "Status", "Message ID"]
         table.add_columns(*columns)
-
         self.thread_data_cache = []
         for thread in sorted_threads:
             full_metadata = str(thread.metadata) if thread.metadata is not None else "N/A"
@@ -107,7 +106,7 @@ class ThreadListScreen(Screen):
                 for i in range(max_lines):
                     row_data = [
                         thread.id if i == 0 else "",
-                        str(datetime.fromtimestamp(thread.created_at/1000)) if i == 0 else "",
+                        str(datetime.fromtimestamp(thread.created_at / 1000)) if i == 0 else "",
                         metadata_lines[i] if i < len(metadata_lines) else "",
                         message_lines[i] if i < len(message_lines) else "",
                         str(thread.messages[0].assistant_id) if i == 0 and len(thread.messages) else "" if i == 0 else "",
@@ -120,7 +119,7 @@ class ThreadListScreen(Screen):
             else:
                 row_data = [
                     thread.id,
-                    str(datetime.fromtimestamp(thread.created_at/1000)),
+                    str(datetime.fromtimestamp(thread.created_at / 1000)),
                     full_metadata[:20] + "..." if len(full_metadata) > 20 else full_metadata,
                     full_last_message[:30] + "..." if len(full_last_message) > 30 else full_last_message,
                     str(thread.messages[0].assistant_id) if len(thread.messages) else "N/A",
@@ -131,15 +130,13 @@ class ThreadListScreen(Screen):
                 ]
                 table.add_row(*row_data)
             self.thread_data_cache.append((thread, full_metadata, full_last_message))
-
         search_input = self.query_one("#search-input", Input)
         if not search_input.has_focus:
             table.focus()
 
     def update_table_wrapping(self):
         table: DataTable = self.query_one("#thread-table", DataTable)
-        table.clear(columns=False)  # Clear rows only, preserve columns
-
+        table.clear(columns=False)
         for thread, full_metadata, full_last_message in self.thread_data_cache:
             if self.wrap_text:
                 metadata_lines = split_text(full_metadata, 20)
@@ -148,7 +145,7 @@ class ThreadListScreen(Screen):
                 for i in range(max_lines):
                     row_data = [
                         thread.id if i == 0 else "",
-                        str(datetime.fromtimestamp(thread.created_at/1000)) if i == 0 else "",
+                        str(datetime.fromtimestamp(thread.created_at / 1000)) if i == 0 else "",
                         metadata_lines[i] if i < len(metadata_lines) else "",
                         message_lines[i] if i < len(message_lines) else "",
                         str(thread.messages[0].assistant_id) if i == 0 and len(thread.messages) else "" if i == 0 else "",
@@ -161,7 +158,7 @@ class ThreadListScreen(Screen):
             else:
                 row_data = [
                     thread.id,
-                    str(datetime.fromtimestamp(thread.created_at/1000)),
+                    str(datetime.fromtimestamp(thread.created_at / 1000)),
                     full_metadata[:20] + "..." if len(full_metadata) > 20 else full_metadata,
                     full_last_message[:30] + "..." if len(full_last_message) > 30 else full_last_message,
                     str(thread.messages[0].assistant_id) if len(thread.messages) else "N/A",
@@ -209,6 +206,18 @@ class ThreadListScreen(Screen):
         self.wrap_text = not self.wrap_text
         self.update_table_wrapping()
 
+    def action_scroll_to_bottom(self) -> None:
+        table: DataTable = self.query_one("#thread-table", DataTable)
+        if table.row_count > 0:
+            for _ in range(table.row_count - 1):
+                table.action_cursor_down()
+
+    def action_scroll_to_top(self) -> None:
+        table: DataTable = self.query_one("#thread-table", DataTable)
+        if table.row_count > 0:
+            for _ in range(table.row_count):
+                table.action_cursor_up()
+
     async def action_open_thread(self) -> None:
         table: DataTable = self.query_one("#thread-table", DataTable)
         row_index = table.cursor_row
@@ -222,15 +231,26 @@ class ThreadListScreen(Screen):
     async def on_thread_open_request(self, message: ThreadOpenRequest) -> None:
         await self.action_open_thread()
 
+    async def on_key(self, event: events.Key) -> None:
+        if event.key == "g":
+            if getattr(self, "g_pressed", False):
+                self.action_scroll_to_top()
+                self.g_pressed = False
+            else:
+                self.g_pressed = True
+                self.set_timer(0.5, lambda: setattr(self, "g_pressed", False))
+
 class ThreadDetailScreen(Screen):
-    BINDINGS = [
+    BINDINGS = (
         ("q", "pop_screen", "Back"),
         ("escape", "pop_screen", "Back"),
         ("j", "table_down", "Move down"),
         ("k", "table_up", "Move up"),
         ("/", "focus_search", "Focus search"),
-        ("w", "toggle_wrap", "Toggle text wrap")
-    ]
+        ("w", "toggle_wrap", "Toggle text wrap"),
+        ("G", "scroll_to_bottom", "Scroll to bottom"),  # Shift+G
+        ("g g", "scroll_to_top", "Scroll to top")      # gg
+    )
 
     def __init__(self, thread_data, manager, **kwargs):
         super().__init__(**kwargs)
@@ -251,9 +271,8 @@ class ThreadDetailScreen(Screen):
             messages = self.all_messages
         sorted_messages = sorted(messages, key=lambda msg: getattr(msg, 'created_at', 0))
         table: DataTable = self.query_one("#messages-table", DataTable)
-        table.clear(columns=True)  # Only clear columns once during initial load
+        table.clear(columns=True)
         table.add_columns("Role", "Message")
-
         self.message_data_cache = []
         for msg in sorted_messages:
             full_message = msg.content[0].text.value if msg.content else "N/A"
@@ -272,7 +291,6 @@ class ThreadDetailScreen(Screen):
                 ]
                 table.add_row(*row_data)
             self.message_data_cache.append((msg, full_message))
-
         scroll_view: ScrollView = self.query_one("#thread-messages", ScrollView)
         scroll_view.scroll_to(y=scroll_view.virtual_size.height, animate=False)
         if not self.query_one("#search-input", Input).has_focus:
@@ -280,8 +298,7 @@ class ThreadDetailScreen(Screen):
 
     def update_table_wrapping(self):
         table: DataTable = self.query_one("#messages-table", DataTable)
-        table.clear(columns=False)  # Clear rows only, preserve columns
-
+        table.clear(columns=False)
         for msg, full_message in self.message_data_cache:
             if self.wrap_text:
                 message_lines = split_text(full_message, 50)
@@ -297,7 +314,6 @@ class ThreadDetailScreen(Screen):
                     full_message[:50] + "..." if len(full_message) > 50 else full_message
                 ]
                 table.add_row(*row_data)
-
         scroll_view: ScrollView = self.query_one("#thread-messages", ScrollView)
         scroll_view.scroll_to(y=scroll_view.virtual_size.height, animate=False)
         table.refresh()
@@ -350,6 +366,31 @@ class ThreadDetailScreen(Screen):
     def action_toggle_wrap(self) -> None:
         self.wrap_text = not self.wrap_text
         self.update_table_wrapping()
+
+    def action_scroll_to_bottom(self) -> None:
+        table: DataTable = self.query_one("#messages-table", DataTable)
+        if table.row_count > 0:
+            for _ in range(table.row_count - 1):
+                table.action_cursor_down()
+            scroll_view: ScrollView = self.query_one("#thread-messages", ScrollView)
+            scroll_view.scroll_to(y=table.row_count - 1, animate=True)
+
+    def action_scroll_to_top(self) -> None:
+        table: DataTable = self.query_one("#messages-table", DataTable)
+        if table.row_count > 0:
+            for _ in range(table.row_count):
+                table.action_cursor_up()
+            scroll_view: ScrollView = self.query_one("#thread-messages", ScrollView)
+            scroll_view.scroll_to(y=0, animate=True)
+
+    async def on_key(self, event: events.Key) -> None:
+        if event.key == "g":
+            if getattr(self, "g_pressed", False):
+                self.action_scroll_to_top()
+                self.g_pressed = False
+            else:
+                self.g_pressed = True
+                self.set_timer(0.5, lambda: setattr(self, "g_pressed", False))
 
 class AssistantTUI(App):
     def on_mount(self) -> None:
