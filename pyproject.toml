@@ -8,6 +8,7 @@ dependencies = [
     "appdirs>=1.4.4",
     "astra-assistants>=2.4.2",
     "loguru>=0.7.3",
+    "openai-agents>=0.0.7",
     "paperclip>=2.7.2",
     "textual>=2.0.4",
 ]

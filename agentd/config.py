@@ -38,3 +38,15 @@ class ConfigManager:
     def set(self, key, value):
         self.config[key] = value
         self.save_config()
+
+    def update_agent_config_field(self, field, value, agent_type, agent_key):
+        # Ensure the nested dictionaries exist
+        agents_config = self.config.setdefault("agents", {})
+        agent_group = agents_config.setdefault(agent_type, {})
+        agent = agent_group.setdefault(agent_key, {})
+
+        # Update the field
+        agent[field] = value
+
+        # Save the updated config
+        self.save_config()
