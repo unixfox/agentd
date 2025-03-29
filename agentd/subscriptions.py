@@ -6,6 +6,10 @@ import re
 from datetime import datetime, timezone
 from loguru import logger
 
+from agentd.section_chunker import unwrap_sections
+from agentd.tool_util import call_tool_with_introspection
+
+
 class Subscription:
     def __init__(self, agent, identifier: str):
         """
@@ -32,7 +36,7 @@ class GoogleDocSubscription(Subscription):
         last_time = 0
         while not self.agent.exit_event.is_set():
             try:
-                result = self.agent.call_tool_with_introspection(
+                result = call_tool_with_introspection(
                     read_comments_tool, {"document_id": self.identifier}
                 )
             except Exception as e:
@@ -65,7 +69,11 @@ class GoogleDocSubscription(Subscription):
                     await self.agent.reply_comment(self.identifier, comment["id"], "👀")
                     logger.info(f"New comment detected in document {self.identifier}.")
                     await self.agent.chat(
-                        f"New comment detected in document {self.identifier}: {comment}."
+                        f"New comment detected in document {self.identifier}: {comment}.\n"
+                        f"The current as displayed to the user is: \n{unwrap_sections(self.agent.doc_state)}\n"
+                        f"The current with sections for editing is: \n{self.agent.doc_state}\n"
+                        "First make a plan and perform any relevant function calls that may apply to your task, "
+                        "then proceed to make the document edits."
                     )
                     last_time = time.time()
                     self.agent.new_comment_event.set()
@@ -81,7 +89,7 @@ class GoogleDocSubscription(Subscription):
         last_prompt_time = 0
         while not self.agent.exit_event.is_set():
             try:
-                result = self.agent.call_tool_with_introspection(
+                result = call_tool_with_introspection(
                     read_doc_tool, {"document_id": self.identifier}
                 )
             except Exception as e:
@@ -137,7 +145,7 @@ class SlackSubscription(Subscription):
         last_timestamp = 0.0
         while not self.agent.exit_event.is_set():
             try:
-                result = self.agent.call_tool_with_introspection(
+                result = call_tool_with_introspection(
                     slack_history_tool, {"channel_id": channel_id, "limit": 10}
                 )
             except Exception as e:
@@ -175,12 +183,12 @@ class SlackSubscription(Subscription):
                 # Convert the chat response and include the bot marker.
                 response_text = markdown_to_slack(chat_result['text'])
                 text_for_post = f"[BOT COMMENT]:\n{response_text}"
-                self.agent.call_tool_with_introspection(
+                call_tool_with_introspection(
                     slack_post_message_tool,
                     {"channel_id": channel_id, "text": text_for_post}
                 )
                 # Mark the message as processed by adding an "eyes" reaction.
-                reaction_return = self.agent.call_tool_with_introspection(
+                reaction_return = call_tool_with_introspection(
                     slack_add_reaction_tool,
                     {"channel_id": channel_id, "timestamp": msg.get("ts"), "reaction": "eyes"}
                 )

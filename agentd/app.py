@@ -2,12 +2,12 @@ import ast
 import json
 import os
 import asyncio
-import time
 import re
 from loguru import logger
-from datetime import datetime, timezone
 
-from config import ConfigManager
+from agentd.section_chunker import wrap_sections, unwrap_sections
+from agentd.config import ConfigManager
+from agentd.tool_util import call_tool_with_introspection
 from agentd.tools.done_tool import DoneTool
 from openai import OpenAI
 from astra_assistants import patch
@@ -15,68 +15,110 @@ from astra_assistants.astra_assistants_manager import AssistantManager
 from astra_assistants.mcp_openai_adapter import MCPRepresentationStdio, MCPRepresentation
 
 # Import our subscription classes.
-from subscriptions import GoogleDocSubscription, SlackSubscription
+from agentd.subscriptions import GoogleDocSubscription, SlackSubscription
+
+
+def extract_rewrite_content(text: str):
+    """
+    Extracts rewrite content from the LLM response.
+    Expects one or more code blocks in the following format:
+      ```[target]
+      <updated code>
+      ```
+    If [target] is provided (e.g. "file1.section1"), that section is updated;
+    if empty, the entire file should be replaced.
+
+    Returns:
+      A list of code block strings if one or more are found; otherwise, None.
+    """
+    pattern = r"```(\S*)\n(.*?)\n```"
+    blocks = ""
+    for match in re.finditer(pattern, text, re.DOTALL):
+        target = match.group(1).strip()
+        updated_code = match.group(2).strip()
+        logger.debug(f"Extracted rewrite content. Target: '{target}', Code: {updated_code[:60]}...")
+        if blocks != "":
+            blocks = f"{blocks}\n```{target}\n{updated_code}\n```"
+        else:
+            blocks = f"```{target}\n{updated_code}\n```"
+    return blocks
+
 
 class Agentd:
     MAX_ITERATIONS = 5
 
-    def __init__(self, instructions: str, config_manager: ConfigManager, mcps: MCPRepresentation):
+    def __init__(self, instructions: str, config_manager: ConfigManager, mcps: MCPRepresentation, doc_id: str = None, channel_id: str = None, assistant_id: str = None, done_assistant_id: str = None):
+        self.thread_id = None
+        self.assistant_manager: AssistantManager = None
+        self.done_manager = None
+        self.current_comment_id = None
+        self.chat_result = None
+        self.last_modified_time = None
+        self.doc_state = None
+
+        self.doc_id = doc_id
+        self.channel_id = channel_id
         self.config_manager = config_manager
         self.config = config_manager.config
         self.instructions = instructions
-
-        self.assistant_manager: AssistantManager = None
-        self.done_manager = None
-
-        self.thread_id = None
-        self.assistant_id = None
+        self.assistant_id = assistant_id
+        self.done_assistant_id = done_assistant_id
         self.tool_cache = {}
         self.interaction_origin = "cli"
-        self.current_comment_id = None
         self.new_comment_event = asyncio.Event()
-        self.chat_result = None
-        self.last_modified_time = None
-
         self.exit_event = asyncio.Event()
-        self.doc_id = None
-
         self._init_managers(mcps)
+        if self.doc_id:
+            self.load_document_state()
+
+    def update_agent_config_field(self, field, value):
+        # Determine agent type and key
+        agent_type = "channels" if self.channel_id else "documents"
+        agent_key = self.channel_id if self.channel_id else self.doc_id
+
+        # Ensure the nested dictionaries exist
+        agents_config = self.config_manager.config.setdefault("agents", {})
+        agent_group = agents_config.setdefault(agent_type, {})
+        agent = agent_group.setdefault(agent_key, {})
+
+        # Update the field
+        agent[field] = value
+
+        # Save the updated config
+        self.config_manager.save_config()
 
     def _init_managers(self, mcps: MCPRepresentation):
-        # Retrieve persistent mapping of agent threads.
-        threads_map = self.config.get("agent_threads", {})
-        # Use saved "current_thread" if available.
-        self.thread_id = threads_map.get("current_thread")
-
-        self.assistant_id = self.config.get("assistant_id")
         client = patch(OpenAI())
         self.assistant_manager = AssistantManager(
             client=client,
-            model="gpt-4o",
+            #model="gpt-4o",
+            model="o3-mini",
             instructions=self.instructions,
             assistant_id=self.assistant_id,
             mcp_represenations=mcps,
+            thread_id=self.thread_id
         )
         if not self.assistant_id:
-            self.config_manager.set("assistant_id", self.assistant_manager.assistant.id)
             self.assistant_id = self.assistant_manager.assistant.id
+            self.update_agent_config_field("assistant_id", self.assistant_id)
             logger.info(f"New assistant created with id: {self.assistant_id}")
 
         # If thread_id is not set, use the assistant manager's thread id and save it.
         if not self.thread_id:
             self.thread_id = self.assistant_manager.thread.id
-            threads_map["current_thread"] = self.thread_id
-            self.config_manager.set("agent_threads", threads_map)
+            self.update_agent_config_field("thread_id", self.thread_id)
             logger.info(f"Thread id set to: {self.thread_id}")
 
         self.cache_tools()
 
-        done_assistant_id = self.config.get("done_assistant_id")
+        done_assistant_id = self.done_assistant_id
         done_instructions = (
             "You are a supervisor agent, your job is to use the tool to determine if a task has "
             "been completed. For a task to be completed it must be reflected in the document itself, "
-            "not just in the conversation. *NOTE* you will receive notifications when the document is updated "
-            "(even by you). If you haven't received a notification, it means you haven't updated the doc. Use the edit_document tool!"
+            "not just in the conversation."
+            "When editing existing documents make sure the edit was applied properly based on the user's intent"
+            "(including appending instead of only replacing)."
+            "Be pedantic about formatting and ensure only intended text makes it into the document."
         )
         self.done_manager = AssistantManager(
             client=client,
@@ -84,9 +126,10 @@ class Agentd:
             assistant_id=done_assistant_id,
             tools=[DoneTool()],
         )
-        if not done_assistant_id:
-            self.config_manager.set("done_assistant_id", self.done_manager.assistant.id)
-            logger.info(f"New done assistant created with id: {self.done_manager.assistant.id}")
+        if not self.done_assistant_id:
+            self.done_assistant_id = self.done_manager.assistant.id
+            self.update_agent_config_field("done_assistant_id", self.done_assistant_id)
+            logger.info(f"New done assistant created with id: {self.done_assistant_id}")
 
     def cache_tools(self):
         self.tool_cache = {}
@@ -94,73 +137,90 @@ class Agentd:
             self.tool_cache[tool.mcp_tool.name] = tool
         logger.debug(f"Cached tools: {list(self.tool_cache.keys())}")
 
-    @staticmethod
-    def call_tool_with_introspection(tool, provided_params: dict):
-        model_cls = tool.get_model()
-        valid_fields = set(model_cls.model_fields.keys())
-        valid_params = {k: v for k, v in provided_params.items() if k in valid_fields}
-        for field_name, field_info in model_cls.model_fields.items():
-            if field_info.is_required() and field_name not in valid_params:
-                raise ValueError(f"Missing required parameter: {field_name}")
-        instance = model_cls(**valid_params)
-        return tool.call(instance)
-
     async def async_input(self, prompt: str) -> str:
         return await asyncio.to_thread(input, prompt)
 
     async def check_done(self):
         tool = DoneTool()
         result = await self.done_manager.run_thread(
-            content="Has the last user request been completed?",
+            content=(
+                f"Has the last user request been completed?\n"
+                f"The current as displayed to the user is: \n{unwrap_sections(self.doc_state)}\n"
+                f"The current with sections for editing is: \n{self.doc_state}\n"
+            ),
             thread_id=self.thread_id,
             tool=tool,
         )
         logger.debug(f"Done check result: {result}")
         return result
 
-    def extract_rewrite_content(self, text: str) -> str:
-        pattern = r"```(.*?)```"
-        matches = re.findall(pattern, text, re.DOTALL)
-        if matches:
-            content = matches[0].strip()
-            logger.debug(f"Extracted rewrite content: {content}")
-            return content
-        return None
+    def load_document_state(self):
+        """Fetch the current document content, split it into sections, and store it in internal state."""
+        read_doc_tool = self.tool_cache.get("read-doc")
+        if read_doc_tool:
+            result = call_tool_with_introspection(read_doc_tool, {"document_id": self.doc_id})
+            raw_content = result.get("output", "")
+
+            if raw_content:
+                self.doc_state = wrap_sections(raw_content)  # Convert to sectioned format
+                logger.info("Document state loaded and sectioned successfully.")
+            else:
+                logger.warning("Empty document retrieved; no sections created.")
+        else:
+            logger.error("Tool 'read-doc' not found in cache.")
 
     def process_rewrite_content(self, content: str):
+        """
+        Applies the rewrite content using the section-based strategy.
+        Update the internal state and call the rewrite-document tool with the new content.
+        """
         rewrite_tool = self.tool_cache.get("rewrite-document")
         if not rewrite_tool:
             logger.error("Tool 'rewrite-document' not found in cache.")
             return
+
+        from agentd.editors.section_based_editor import SectionBasedEditor
+        if not self.doc_state:
+            logger.warning("Internal document state not initialized; loading state.")
+            # Optionally, load state synchronously or asynchronously here.
+            self.load_document_state()
+
         try:
-            result = self.call_tool_with_introspection(
-                rewrite_tool, {"document_id": self.doc_id, "final_text": content}
+            coder = SectionBasedEditor()
+            # Update internal state based on the edit.
+            updated_content = coder.apply_edits(self.doc_state, content)
+            updated_content = unwrap_sections(updated_content)
+            call_tool_with_introspection(
+                rewrite_tool, {"document_id": self.doc_id, "final_text": updated_content}
             )
-            logger.info(f"Rewrite-document tool call result: {result.get('output', 'No output')}")
-            return result
+            self.load_document_state()
+            return self.doc_state
         except Exception as e:
-            logger.error(f"Error calling rewrite-document tool: {e}")
+            logger.error(f"Error applying section-based update: {e}")
             return None
 
     async def chat(self, prompt: str):
         self.chat_result = await self.assistant_manager.run_thread(content=prompt, thread_id=self.thread_id)
         arguments = self.chat_result.get("arguments")
         if arguments is not None:
-            logger.info(f"Tool Call: {arguments.__class__.__name__}({arguments}) \nTool Call Result: {self.chat_result['output']}")
+            logger.info(
+                f"Tool Call: {arguments.__class__.__name__}({arguments}) \nTool Call Result: {self.chat_result['output']}")
             # If the LLM requested a create-doc tool call, trigger new document creation.
             if self.chat_result['arguments'].__class__.__name__ == 'CreateDoc':
-                new_doc_id = self.chat_result["text"].split(":")[2].split("/")[5]
-                logger.info(f"LLM requested new document creation: {new_doc_id}")
-                # Spawn a new agent instance for the new document.
-                asyncio.create_task(run_agent_instance(new_doc_id))
+                chat_text = self.chat_result["text"]
+                if "https://docs.google.com/document/d" in chat_text and len(chat_text.split("https:")) >= 2:
+                    new_doc_id = self.chat_result["text"].split("https:")[1].split("/")[5]
+                    logger.info(f"LLM requested new document creation: {new_doc_id}")
+                    # Spawn a new agent instance for the new document.
+                    asyncio.create_task(run_agent_instance(doc_id=new_doc_id, mcps=load_mcps_for("documents")))
         text = self.chat_result.get("text", "No text response found.")
         logger.info(f"Assistant response: {text}")
 
-        rewrite_content = self.extract_rewrite_content(text)
+        rewrite_content = extract_rewrite_content(text)
         if rewrite_content and self.doc_id:
-            logger.info("Detected rewrite content in triple backticks; calling rewrite-document tool...")
-            self.process_rewrite_content(rewrite_content)
-            await self.chat(f"Here is the current content of the document: {rewrite_content}")
+            logger.info("Detected rewrite content; applying section-based update...")
+            rewrite_result = self.process_rewrite_content(rewrite_content)
+            # await self.chat(f"Here is the updated document content:\n{rewrite_result}")
         return self.chat_result
 
     async def add_comment(self, doc_id: str, comment: str):
@@ -168,13 +228,13 @@ class Agentd:
         if not create_comment_tool:
             logger.error("Tool 'create-comment' not found in cache.")
             return
-        return self.call_tool_with_introspection(create_comment_tool, {"document_id": doc_id, "content": comment})
+        return call_tool_with_introspection(create_comment_tool, {"document_id": doc_id, "content": comment})
 
     async def reply_comment(self, doc_id: str, comment_id: str, reply: str):
         reply_comment_tool = self.tool_cache.get("reply-comment")
         if not reply_comment_tool:
             raise ValueError("reply-comment tool is missing")
-        return self.call_tool_with_introspection(
+        return call_tool_with_introspection(
             reply_comment_tool,
             {"document_id": doc_id, "comment_id": comment_id, "reply": f"[BOT COMMENT]:\n{reply}"},
         )
@@ -209,9 +269,9 @@ class Agentd:
 
             logger.debug(f"Chat result: {self.chat_result}")
 
-            if "arguments" in self.chat_result:
-                await self.chat("continue")
-                continue
+            # if "arguments" in self.chat_result:
+            #    await self.chat("continue, ensure you apply the edit(s) with backticks and carefully number the sections")
+            #    continue
 
             await self.chat("continue")
             done_result = await self.check_done()
@@ -254,7 +314,7 @@ class Agentd:
             return
 
         try:
-            result = self.call_tool_with_introspection(read_comments_tool, {"document_id": doc_id})
+            result = call_tool_with_introspection(read_comments_tool, {"document_id": doc_id})
         except Exception as e:
             logger.error(f"Error calling read-comments tool: {e}")
             return
@@ -267,7 +327,7 @@ class Agentd:
                     comment_id = comment["id"]
                     reply_id = last_reply["id"]
                     try:
-                        self.call_tool_with_introspection(
+                        call_tool_with_introspection(
                             delete_reply_tool,
                             {"document_id": doc_id, "comment_id": comment_id, "reply_id": reply_id},
                         )
@@ -276,128 +336,259 @@ class Agentd:
                         logger.error(f"Error calling delete-reply tool: {e}")
                         return
 
-    async def run(self, doc_id: str):
-        self.doc_id = doc_id
-        await self.clear_acks(doc_id)
+    async def run(self):
+        if self.doc_id:
+            await self.clear_acks(self.doc_id)
         await self.chat(prompt="What tools do you have access to? Make sure you use them going forward.")
-        self.thread_id = self.assistant_manager.thread.id
-
-        # Update persistent mapping: associate this thread with its doc_id.
-        threads_map = self.config.get("agent_threads", {})
-        threads_map[self.thread_id] = doc_id
-        threads_map["current_thread"] = self.thread_id
-        self.config_manager.set("agent_threads", threads_map)
+        if not self.thread_id:
+            self.thread_id = self.assistant_manager.thread.id
+            self.update_agent_config_field( "thread_id", self.thread_id)
+            logger.info(f"Thread id set to: {self.thread_id}")
 
         # Create modular subscriptions.
         subscriptions = []
-        google_sub = GoogleDocSubscription(self, doc_id)
-        subscriptions.append(google_sub)
-        if self.config.get("enable_slack_polling", True):
-            list_channels_tool = self.tool_cache.get("slack_list_channels")
-            if not list_channels_tool:
-                logger.error("Tool 'slack_list_channels' not found in cache.")
-                return
-            result = self.call_tool_with_introspection(list_channels_tool, {"limit": 10})
-            output = json.loads(result["output"])
-            channels = [channel for channel in output.get('channels', [])
-                        if channel.get('name') == 'all-jake-test-ground']
-            if not channels:
-                logger.error("No channel found with name 'all-jake-test-ground'.")
-                return
-            channel_id = channels[0]['id']
-            slack_sub = SlackSubscription(self, channel_id)
+        if self.doc_id:
+            google_sub = GoogleDocSubscription(self, self.doc_id)
+            subscriptions.append(google_sub)
+        if self.channel_id:
+            #list_channels_tool = self.tool_cache.get("slack_list_channels")
+            #if not list_channels_tool:
+            #    logger.error("Tool 'slack_list_channels' not found in cache.")
+            #    return
+            #result = call_tool_with_introspection(list_channels_tool, {"limit": 10})
+            #output = json.loads(result["output"])
+            #channels = [channel for channel in output.get('channels', [])
+            #            if channel.get('name') == 'all-jake-test-ground']
+            #if not channels:
+            #    logger.error("No channel found with name 'all-jake-test-ground'.")
+            #    return
+            #channel_id = channels[0]['id']
+            #slack_sub = SlackSubscription(self, channel_id)
+            slack_sub = SlackSubscription(self, self.channel_id)
             subscriptions.append(slack_sub)
 
         tasks = [
-            asyncio.create_task(self.cli_loop(doc_id)),
+            asyncio.create_task(self.cli_loop(self.doc_id)),
             *[asyncio.create_task(sub.poll()) for sub in subscriptions],
         ]
         await asyncio.gather(*tasks)
 
     async def create_doc(self):
         create_doc_tool = self.tool_cache.get("create-doc")
-        result = self.call_tool_with_introspection(create_doc_tool, {"title": "New Doc"})
+        result = call_tool_with_introspection(create_doc_tool, {"title": "New Doc"})
         logger.info(f"Assistant response: {result['output']}")
         doc_id = result["output"].split(":")[2].split("/")[5]
         return doc_id
 
+
 # Helper to run an agent instance.
 # If doc_id and thread_id are provided, re-instantiate that agent; otherwise, create a new document.
-async def run_agent_instance(doc_id: str = None, thread_id: str = None):
+async def run_agent_instance(doc_id: str = None, assistant_id: str = None, done_assistant_id: str = None, thread_id: str = None, channel_id = None, mcps = None):
+    if not mcps:
+        mcps = []
+
     instructions = (
         "You are a long running document writing agent. "
-        "You will be notified of doc changes and comments. "
-        "When you want to update the document, please enclose your new content in triple backticks (```your content```). "
-        "I will then automatically update the document using that content. "
-        "When in doubt, ensure you are looking at the latest version of the doc. "
-        "Don't use any markdown in the google doc. "
-        "Always include URLs in your citations when referencing content from search tools. "
+        "You will be notified of doc changes and comments and your job is to update documents according to instructions. \n"
+        "To edit the existing document you must wrap text content in backticks. \n\n"
+        "The documents you work with will be divided into sections that are marked."
+        "For the following examples lets work with the following document:\n"
+        "###SECTION:1###\n"
+        "section 1 content goes here\n"
+        "###ENDSECTION###\n"
+        "###SECTION:2###\n"
+        "section 2 content goes here\n"
+        "###ENDSECTION###\n\n"
+        "When making changes to one of the sections, return your edits as a complete, updated text block(s) surrounded in backticks. "
+        "If you include a section label (for example, 'section1') in the opening backticks, "
+        "only that section will be updated. "
+        "To update a section:\n"
+
+        "```section1\n<updated text>\n```\n\n"
+
+        "To update multiple sections write multiple blocks"
+        "```section1\n<updated text 1>\n```\n\n"
+        "```section3\n<updated text 2>\n```\n\n"
+
+        "If you do not provide a section label (i.e. the opening backticks are empty)\n\n"
+        "the entire document will be replaced with your output:\n\n"
+        "To replace the entire doc:\n"
+        "```\n<new full file content>\n```\n\n"
+
+        "To add a new section at the end of the document pass a block with a *new* section id:\n"
+        "```section3\nsection 3 text\n```\n\n"
+
+        "By default, if a new section is created, it will be appended at the end.\n\n"
+
+        "Feel free to move lines across section boundaries by replacing multiple boundaries if it helps make the section breaks more logical\n\n"
+        "for example if you have\n"
+        "```section1\na line about topic 1\nanother line about topic 1\nsomething about topic 2\n```\n\n"
+        "```section2\nmore info on topic 2\n```\n\n"
+        "modify it by sending\n"
+        "```section1\na line about topic 1\nanother line about topic 1\n```\n\n"
+        "```section2\nsomething about topic 2\nmore info on topic 2\n```\n\n"
+
+
+        "You don't need to talk to the user about sections, they're purely there to help you make edits to the doc.\n"
+        "When in doubt, ensure you are looking at the latest version of the doc.\n"
+        "Don't use any markdown in the google doc.\n"
+        "Always include URLs in your citations when referencing content from search tools.\n"
+        "Only create new documents when specifically prompted to do so by the user. "
         "When you create documents make sure to share them with datastax.com. "
     )
     config_manager = ConfigManager(app_name="agentd", app_author="phact")
-    brave_key = os.environ['BRAVE_API_KEY']
-    mcps = [
-        MCPRepresentationStdio(
-            type="stdio",
-            command="uv",
-            arguments=[
-                "run",
-                "--refresh",
-                "--with",
-                "../mcp-google-docs",
-                "server",
-                "--creds-file-path",
-                "../mcp-google-docs/.auth/client_secret_1049158366095-o78hnepquu77t0uf3gr7q5ik887a6tvv.apps.googleusercontent.com.json",
-                "--token-path",
-                "../mcp-google-docs/.auth/token",
-            ],
-            tool_filter=['read-doc', 'create-doc']
-        ),
-        MCPRepresentationStdio(
-            type="stdio",
-            command="npx",
-            arguments=["-y", "@modelcontextprotocol/server-brave-search"],
-            env_vars=[f"BRAVE_API_KEY={brave_key}"]
-        ),
-        MCPRepresentationStdio(
-            type="stdio",
-            command="uv",
-            arguments=["run", "--refresh", "--with", "mcp_simple_arxiv", "mcp-simple-arxiv"],
-        ),
-        MCPRepresentationStdio(
-            type="stdio",
-            command="npx",
-            arguments=["-y", "@modelcontextprotocol/server-slack"],
-            env_vars=[
-                f"SLACK_BOT_TOKEN={os.environ['SLACK_BOT_TOKEN']}",
-                f"SLACK_TEAM_ID={os.environ['SLACK_TEAM_ID']}",
-            ]
-        )
-    ]
-    agent = Agentd(instructions, config_manager, mcps)
-    # Override thread_id if provided.
+    agent = Agentd(
+        instructions=instructions,
+        config_manager=config_manager,
+        mcps=mcps,
+        doc_id=doc_id,
+        channel_id=channel_id,
+        assistant_id=assistant_id,
+        done_assistant_id=done_assistant_id
+    )
     if thread_id:
         agent.thread_id = thread_id
-    # Create a new document if doc_id not provided.
-    if not doc_id:
-        doc_id = await agent.create_doc()
-        logger.info(f"New document created: {doc_id}")
-    logger.info(f"Starting agent instance with doc: {doc_id} and thread: {agent.thread_id}")
-    await agent.run(doc_id)
+    await agent.run()
+
 
 # Startup routine.
 async def main():
     config_manager = ConfigManager(app_name="agentd", app_author="phact")
-    agents_map = config_manager.config.get("agent_threads", {})
+    config = config_manager.config
     tasks = []
-    # Re-instantiate agents from saved mapping (skip reserved keys like "current_thread").
-    for key, doc in agents_map.items():
-        if key == "current_thread":
-            continue
-        tasks.append(asyncio.create_task(run_agent_instance(doc_id=doc, thread_id=key)))
-    if not tasks:
-        tasks.append(asyncio.create_task(run_agent_instance()))
+
+    # Instantiate Slack-based agents
+    for channel_id, agent_info in config.get("agents", {}).get("channels", {}).items():
+        tasks.append(asyncio.create_task(
+            run_agent_instance(
+                doc_id=None,
+                channel_id=channel_id,
+                assistant_id=agent_info.get("assistant_id"),
+                done_assistant_id=agent_info.get("done_assistant_id"),
+                thread_id=agent_info.get("thread_id"),
+                mcps=load_mcps_for("slack")
+            )
+        )
+    )
+
+    if len(tasks) == 0:
+        tasks.append(asyncio.create_task(run_agent_instance(
+            channel_id="C08H4QLK2RF",
+            mcps=load_mcps_for("slack")
+        )))
+
+    # Instantiate document-based agents
+    for doc_id, agent_info in config.get("agents", {}).get("documents", {}).items():
+        tasks.append(
+            asyncio.create_task(
+                run_agent_instance(
+                    doc_id=doc_id,
+                    assistant_id=agent_info.get("assistant_id"),
+                    done_assistant_id=agent_info.get("done_assistant_id"),
+                    thread_id=agent_info.get("thread_id"),
+                    mcps=load_mcps_for("documents")
+                )
+            )
+        )
+
+
     await asyncio.gather(*tasks)
+
+def load_mcps_for(subscription_type: str):
+    brave_key = os.environ['BRAVE_API_KEY']
+    mcps_mapping = {
+        "documents": [
+            MCPRepresentationStdio(
+                type="stdio",
+                command="uv",
+                arguments=[
+                    "run",
+                    "--refresh",
+                    "--with",
+                    "../mcp-google-docs",
+                    "server",
+                    "--creds-file-path",
+                    "../mcp-google-docs/.auth/client_secret_1049158366095-o78hnepquu77t0uf3gr7q5ik887a6tvv.apps.googleusercontent.com.json",
+                    "--token-path",
+                    "../mcp-google-docs/.auth/token",
+                ],
+                tool_filter=['']
+            ),
+            #MCPRepresentationStdio(
+            #    type="stdio",
+            #    command="npx",
+            #    arguments=["-y", "@modelcontextprotocol/server-brave-search"],
+            #    env_vars=[f"BRAVE_API_KEY={brave_key}"],
+            #),
+            #MCPRepresentationStdio(
+            #    type="stdio",
+            #    command="uvx",
+            #    arguments=["mcp-server-fetch"],
+            #),
+            #MCPRepresentationStdio(
+            #    type="stdio",
+            #    command="uv",
+            #    arguments=["run", "--refresh", "--with", "mcp_simple_arxiv", "mcp-simple-arxiv"],
+            #),
+            MCPRepresentationStdio(
+                type="stdio",
+                command="npx",
+                arguments=["-y", "@modelcontextprotocol/server-slack"],
+                env_vars=[
+                    f"SLACK_BOT_TOKEN={os.environ['SLACK_BOT_TOKEN']}",
+                    f"SLACK_TEAM_ID={os.environ['SLACK_TEAM_ID']}",
+                ],
+                tool_filter=['']
+            ),
+            MCPRepresentationStdio(
+                type="stdio",
+                command="uv",
+                arguments=["run","--refresh","--with","mcp_browser_use_tools", "mcp_server", "--headless"],
+            )
+        ],
+        "slack": [
+            MCPRepresentationStdio(
+                type="stdio",
+                command="uv",
+                arguments=[
+                    "run",
+                    "--refresh",
+                    "--with",
+                    "../mcp-google-docs",
+                    "server",
+                    "--creds-file-path",
+                    "../mcp-google-docs/.auth/client_secret_1049158366095-o78hnepquu77t0uf3gr7q5ik887a6tvv.apps.googleusercontent.com.json",
+                    "--token-path",
+                    "../mcp-google-docs/.auth/token",
+                ],
+                tool_filter=['create-doc']
+            ),
+            MCPRepresentationStdio(
+                type="stdio",
+                command="npx",
+                arguments=["-y", "@modelcontextprotocol/server-brave-search"],
+                env_vars=[f"BRAVE_API_KEY={brave_key}"],
+                tool_filter=['']
+            ),
+            MCPRepresentationStdio(
+                type="stdio",
+                command="uv",
+                arguments=["run", "--refresh", "--with", "mcp_simple_arxiv", "mcp-simple-arxiv"],
+                tool_filter=['']
+            ),
+            MCPRepresentationStdio(
+                type="stdio",
+                command="npx",
+                arguments=["-y", "@modelcontextprotocol/server-slack"],
+                env_vars=[
+                    f"SLACK_BOT_TOKEN={os.environ['SLACK_BOT_TOKEN']}",
+                    f"SLACK_TEAM_ID={os.environ['SLACK_TEAM_ID']}",
+                ],
+                tool_filter=['']
+            )
+        ]
+    }
+    return mcps_mapping.get(subscription_type, [])
 
 if __name__ == "__main__":
     asyncio.run(main())

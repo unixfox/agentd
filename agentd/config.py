@@ -3,11 +3,6 @@ import os
 from appdirs import user_config_dir
 from loguru import logger
 
-DEFAULT_CONFIG = {
-    "assistant_id": None,
-    "thread_id": None,
-    "done_assistant_id": None,
-}
 
 class ConfigManager:
     def __init__(self, app_name: str, app_author: str):
@@ -16,7 +11,7 @@ class ConfigManager:
         self.config_dir = user_config_dir(app_name, app_author)
         os.makedirs(self.config_dir, exist_ok=True)
         self.config_file = os.path.join(self.config_dir, "config.json")
-        self.config = DEFAULT_CONFIG.copy()
+        self.config = {}
         self.load_config()
 
     def load_config(self):

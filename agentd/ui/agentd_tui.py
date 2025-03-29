@@ -1,3 +1,4 @@
+import time
 from datetime import datetime
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -24,7 +25,6 @@ class ThreadOpenRequest(Message):
 class MyDataTable(DataTable):
     def action_select_cursor(self) -> None:
         pass
-
     def key_enter(self) -> None:
         self.post_message(ThreadOpenRequest(self.cursor_row))
 
@@ -58,8 +58,8 @@ class ThreadListScreen(Screen):
         ("/", "focus_search", "Focus search"),
         ("l", "open_thread", "Open thread"),
         ("w", "toggle_wrap", "Toggle text wrap"),
-        ("G", "scroll_to_bottom", "Scroll to bottom"),  # Shift+G
-        ("g g", "scroll_to_top", "Scroll to top")      # gg
+        ("G", "scroll_to_bottom", "Scroll to bottom"),
+        # Removed the "g g" binding here; we'll handle it in on_key.
     )
 
     def __init__(self, name: str | None = None, id: str | None = None, classes: str | None = None):
@@ -67,6 +67,7 @@ class ThreadListScreen(Screen):
         self.all_threads = None
         self.wrap_text = False
         self.thread_data_cache = []
+        self.last_g_time = 0  # For detecting double "g"
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -84,7 +85,6 @@ class ThreadListScreen(Screen):
             if not threads:
                 raise Exception("No threads found.")
         except Exception as e:
-            logging.error(f"Error fetching threads: {e}")
             threads = [self.assistant_manager.thread]
         self.all_threads = threads
         self.load_table(self.all_threads)
@@ -106,7 +106,7 @@ class ThreadListScreen(Screen):
                 for i in range(max_lines):
                     row_data = [
                         thread.id if i == 0 else "",
-                        str(datetime.fromtimestamp(thread.created_at / 1000)) if i == 0 else "",
+                        str(datetime.fromtimestamp(thread.created_at/1000)) if i == 0 else "",
                         metadata_lines[i] if i < len(metadata_lines) else "",
                         message_lines[i] if i < len(message_lines) else "",
                         str(thread.messages[0].assistant_id) if i == 0 and len(thread.messages) else "" if i == 0 else "",
@@ -119,7 +119,7 @@ class ThreadListScreen(Screen):
             else:
                 row_data = [
                     thread.id,
-                    str(datetime.fromtimestamp(thread.created_at / 1000)),
+                    str(datetime.fromtimestamp(thread.created_at/1000)),
                     full_metadata[:20] + "..." if len(full_metadata) > 20 else full_metadata,
                     full_last_message[:30] + "..." if len(full_last_message) > 30 else full_last_message,
                     str(thread.messages[0].assistant_id) if len(thread.messages) else "N/A",
@@ -145,7 +145,7 @@ class ThreadListScreen(Screen):
                 for i in range(max_lines):
                     row_data = [
                         thread.id if i == 0 else "",
-                        str(datetime.fromtimestamp(thread.created_at / 1000)) if i == 0 else "",
+                        str(datetime.fromtimestamp(thread.created_at/1000)) if i == 0 else "",
                         metadata_lines[i] if i < len(metadata_lines) else "",
                         message_lines[i] if i < len(message_lines) else "",
                         str(thread.messages[0].assistant_id) if i == 0 and len(thread.messages) else "" if i == 0 else "",
@@ -158,7 +158,7 @@ class ThreadListScreen(Screen):
             else:
                 row_data = [
                     thread.id,
-                    str(datetime.fromtimestamp(thread.created_at / 1000)),
+                    str(datetime.fromtimestamp(thread.created_at/1000)),
                     full_metadata[:20] + "..." if len(full_metadata) > 20 else full_metadata,
                     full_last_message[:30] + "..." if len(full_last_message) > 30 else full_last_message,
                     str(thread.messages[0].assistant_id) if len(thread.messages) else "N/A",
@@ -232,13 +232,15 @@ class ThreadListScreen(Screen):
         await self.action_open_thread()
 
     async def on_key(self, event: events.Key) -> None:
+        """Detect a quick double-press of 'g' to scroll to top."""
         if event.key == "g":
-            if getattr(self, "g_pressed", False):
+            now = time.time()
+            # Check if the previous 'g' was pressed within 0.5 seconds.
+            if now - self.last_g_time < 0.5:
                 self.action_scroll_to_top()
-                self.g_pressed = False
+                self.last_g_time = 0  # reset
             else:
-                self.g_pressed = True
-                self.set_timer(0.5, lambda: setattr(self, "g_pressed", False))
+                self.last_g_time = now
 
 class ThreadDetailScreen(Screen):
     BINDINGS = (
@@ -248,8 +250,8 @@ class ThreadDetailScreen(Screen):
         ("k", "table_up", "Move up"),
         ("/", "focus_search", "Focus search"),
         ("w", "toggle_wrap", "Toggle text wrap"),
-        ("G", "scroll_to_bottom", "Scroll to bottom"),  # Shift+G
-        ("g g", "scroll_to_top", "Scroll to top")      # gg
+        ("G", "scroll_to_bottom", "Scroll to bottom"),
+        # Removed "g g" here; we'll also handle double "g" manually.
     )
 
     def __init__(self, thread_data, manager, **kwargs):
@@ -259,6 +261,7 @@ class ThreadDetailScreen(Screen):
         self.all_messages = []
         self.wrap_text = False
         self.message_data_cache = []
+        self.last_g_time = 0  # For detecting double "g"
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -384,13 +387,14 @@ class ThreadDetailScreen(Screen):
             scroll_view.scroll_to(y=0, animate=True)
 
     async def on_key(self, event: events.Key) -> None:
+        """Detect a quick double-press of 'g' to scroll to top."""
         if event.key == "g":
-            if getattr(self, "g_pressed", False):
+            now = time.time()
+            if now - self.last_g_time < 0.5:
                 self.action_scroll_to_top()
-                self.g_pressed = False
+                self.last_g_time = 0
             else:
-                self.g_pressed = True
-                self.set_timer(0.5, lambda: setattr(self, "g_pressed", False))
+                self.last_g_time = now
 
 class AssistantTUI(App):
     def on_mount(self) -> None:

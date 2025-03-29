@@ -25,6 +25,8 @@ def test_list_threads_integration(manager):
         # Each thread should have an 'id' attribute.
         assert hasattr(thread, "id")
         assert isinstance(thread.id, str)
+        for message in thread.messages:
+            print(message)
 
 def test_list_messages_integration(manager):
     threads = list_threads(manager)
