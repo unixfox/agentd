@@ -1,0 +1,21 @@
+agents:
+  - name: news_agent
+    model: gpt-4o-mini
+    system_prompt: |
+      You are cool fact getter. New cool facts will stream to you periodically.
+    tools:
+      - type: stdio
+        command: uv
+        arguments:
+          - "run"
+          - "mcp_subscribe"
+          - "--poll-interval"
+          - "5"
+          - "--"
+          - "uvx"
+          - "mcp-server-fetch"
+        env_vars: []
+        tool_filter: []
+    subscriptions:
+      - "tool://fetch/?url=https://www.randomfunfacts.com/"
+
