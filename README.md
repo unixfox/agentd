@@ -1,6 +1,6 @@
 # agentd
 
-view sample configs in the `config/` directory
+View sample configs in the [`config/`](https://github.com/phact/agentd/tree/main/config) directory
 
 ### to run:
 
