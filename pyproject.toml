@@ -5,18 +5,23 @@ description = "agent daemon"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "appdirs>=1.4.4",
-    "astra-assistants>=2.4.2",
-    "loguru>=0.7.3",
-    "openai-agents>=0.0.7",
-    "paperclip>=2.7.2",
-    "textual>=2.0.4",
+    "mcp-subscribe",
+    "openai>=1.76.0",
+    "pyyaml>=6.0.2",
 ]
-
-[tool.uv.sources]
-astra-assistants = { path = "../astra-assistants-api/client" }
 
 [dependency-groups]
 dev = [
     "pytest>=8.3.4",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agentd/"]
+
+
+[project.scripts]
+agentd = "agentd.app:main"

@@ -1,0 +1,22 @@
+agents:
+  - name: news_agent
+    model: gpt-4o-mini
+    system_prompt: |
+      You are a news summarizer. Whenever new articles arrive via the fetch tool,
+      provide a concise, bullet-point summary.
+    tools:
+      - type: stdio
+        command: uv
+        arguments:
+          - "run"
+          - "mcp_subscribe"
+          - "--poll-interval"
+          - "5"
+          - "--"
+          - "uvx"
+          - "mcp-server-fetch"
+        env_vars: []
+        tool_filter: []
+    subscriptions:
+      - "tool://fetch/?url=https://news.ycombinator.com/news"
+

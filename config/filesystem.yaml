@@ -1,0 +1,23 @@
+agents:
+  - name: filesystem_agent
+    model: gpt-4o-mini
+    system_prompt: |
+      You can view and modify the user's file system. Expect periodic updates of existing files.
+    tools:
+      - type: stdio
+        command: uv
+        arguments:
+          - "run"
+          - "mcp_subscribe"
+          - "--poll-interval"
+          - "5"
+          - "--"
+          - "npx"
+          - "-y"
+          - "@modelcontextprotocol/server-filesystem"
+          - "/tmp/"
+        env_vars: []
+        tool_filter: []
+    subscriptions:
+      - "tool://list_directory/?path=/tmp/"
+
