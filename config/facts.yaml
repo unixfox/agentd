@@ -3,7 +3,7 @@ agents:
     model: gpt-4o-mini
     system_prompt: |
       You are cool fact getter. New cool facts will stream to you periodically.
-    tools:
+    mcp_servers:
       - type: stdio
         command: uv
         arguments:

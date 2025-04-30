@@ -1,40 +1,15 @@
 import asyncio
-import urllib
-from urllib.parse import parse_qs
+from agents.mcp.server import MCPServerStdio
 
 import yaml
 import traceback
 import argparse
-from dataclasses import dataclass, field
 from typing import List, Any
 
-from mcp import ClientSession
-from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp_subscribe.util import call_tool_from_uri
 import openai
 
-
-@dataclass
-class ToolConfig:
-    type: str
-    command: str
-    arguments: List[str]
-    env_vars: List[str] = field(default_factory=list)
-    tool_filter: List[str] = field(default_factory=list)
-
-
-@dataclass
-class AgentConfig:
-    name: str
-    model: str
-    system_prompt: str
-    tools: List[ToolConfig]
-    subscriptions: List[str] = field(default_factory=list)
-
-
-@dataclass
-class Config:
-    agents: List[AgentConfig]
+from agentd.model.config import Config, MCPServerConfig, AgentConfig
 
 
 def load_config(path: str) -> Config:
@@ -42,12 +17,12 @@ def load_config(path: str) -> Config:
         data = yaml.safe_load(f)
     agents = []
     for ag in data.get('agents', []):
-        tools = [ToolConfig(**tool) for tool in ag.get('tools', [])]
+        servers = [MCPServerConfig(**server) for server in ag.get('mcp_servers', [])]
         agents.append(AgentConfig(
             name=ag['name'],
             model=ag['model'],
             system_prompt=ag['system_prompt'],
-            tools=tools,
+            mcp_servers=servers,
             subscriptions=ag.get('subscriptions', [])
         ))
     return Config(agents=agents)
@@ -58,7 +33,8 @@ class Agent:
         self.config = config
         self.messages: List[Any] = []
         self.history = [{"role": "system", "content": config.system_prompt}]
-        self.session: ClientSession | None = None
+        #self.session: ClientSession | None = None
+        self.session = None
         self.client = openai.AsyncClient()
 
     async def handle_notification(self, message: Any):
@@ -108,24 +84,27 @@ class Agent:
                 traceback.print_exc()
 
     async def run(self):
-        tool = self.config.tools[0]
-        params = StdioServerParameters(
-            command=tool.command,
-            args=tool.arguments,
-            env={kv.split('=',1)[0]: kv.split('=',1)[1] for kv in tool.env_vars}
-        )
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write, message_handler=self.handle_notification) as session:
-                self.session = session
-                await self.session.initialize()
-                await self.subscribe_resources()
-                print(f"Agent {self.config.name} ready. Type 'quit' to exit.")
+        tool = self.config.mcp_servers[0]
 
-                # Run both loops concurrently
-                await asyncio.gather(
-                    self.process_notifications(),
-                    self.process_user_input()
-                )
+        server = MCPServerStdio(
+            params={
+                "command": tool.command,
+                "args": tool.arguments,
+                "env": {kv.split('=',1)[0]: kv.split('=',1)[1] for kv in tool.env_vars}
+            },
+            cache_tools_list=True
+        )
+
+        await server.connect()
+        self.session = server.session
+        server.session._message_handler = self.handle_notification
+        await self.subscribe_resources()
+        print(f"Agent {self.config.name} ready. Type 'quit' to exit.")
+
+        await asyncio.gather(
+            self.process_notifications(),
+            self.process_user_input()
+        )
 
 
 def main():

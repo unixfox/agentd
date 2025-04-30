@@ -3,7 +3,7 @@ agents:
     model: gpt-4o-mini
     system_prompt: |
       You can view and modify the user's file system. Expect periodic updates of existing files.
-    tools:
+    mcp_servers:
       - type: stdio
         command: uv
         arguments:

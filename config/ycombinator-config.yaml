@@ -4,7 +4,7 @@ agents:
     system_prompt: |
       You are a news summarizer. Whenever new articles arrive via the fetch tool,
       provide a concise, bullet-point summary.
-    tools:
+    mcp_servers:
       - type: stdio
         command: uv
         arguments:
