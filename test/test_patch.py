@@ -23,8 +23,9 @@ remote_server = MCPServerSse(
 client = patch_openai_with_mcp(OpenAI())  # Get the patched client back
 
 response = client.chat.completions.create(
-    model="claude-3-5-sonnet-20240620",
     #model="gpt-4o",
+    #model="claude-3-5-sonnet-20240620",
+    model="gemini/gemini-2.0-flash",
     messages=[
         {"role": "user", "content": "List the files in /tmp/ using the tool"}
     ],
