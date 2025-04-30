@@ -146,10 +146,9 @@ def patch_openai_with_mcp(client):
                      "tool_call_id": call["id"] if isinstance(call, dict) else call.id},
                 ]
 
-            # After executing all tool calls, strip tool params before next loop
-            clean_kwargs.pop("tools", None)
-            clean_kwargs.pop("tool_choice", None)
-            tools = None   # subsequent turns shouldn't resend schemas
+            #clean_kwargs.pop("tools", None)
+            #clean_kwargs.pop("tool_choice", None)
+            #tools = None   # subsequent turns shouldn't resend schemas
 
     @wraps(Completions.create)
     def patched_sync(self, *args, model=None, messages=None,
