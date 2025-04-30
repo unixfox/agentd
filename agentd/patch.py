@@ -2,11 +2,11 @@
 
 import asyncio
 import json
-import os
 from functools import wraps
 from openai.resources.chat.completions import Completions, AsyncCompletions
 from agents.mcp.util import MCPUtil
 import litellm.utils as llm_utils
+import litellm
 
 # Global server cache
 _SERVER_CACHE = {}
@@ -55,14 +55,6 @@ def patch_openai_with_mcp(client):
             }
         } for tool in tools]
 
-    def _get_provider(model):
-        """Configure client headers and base URL."""
-        _, provider, dynamic_key, _ = llm_utils.get_llm_provider(model)
-        client._custom_headers["api-key"] = llm_utils.get_api_key(provider, dynamic_key)
-        if provider != "openai":
-            client.base_url = os.getenv(f"{provider.upper()}_API_BASE_URL")
-        return provider
-
     def _clean_kwargs(kwargs):
         """Remove our custom kwargs."""
         kwargs = kwargs.copy()
@@ -76,13 +68,21 @@ def patch_openai_with_mcp(client):
 
     async def _handle_completion(
             self, args, model, messages,
-            *, mcp_servers, mcp_strict, tools, kwargs, async_mode
+            mcp_servers, mcp_strict, tools, kwargs, async_mode
     ):
+        if mcp_servers and tools:
+            raise ValueError("Cannot specify both mcp_servers and tools")
+
+        if mcp_servers:
+            tools = await _prepare(mcp_servers, mcp_strict)
+
         server_lookup = {t.name: s
                          for s in mcp_servers
                          for t in await s.list_tools()}
 
+        _, provider, api_key, _ = llm_utils.get_llm_provider(model)
         clean_kwargs = _clean_kwargs(kwargs)
+
         if tools and "tool_choice" not in clean_kwargs:
             clean_kwargs["tool_choice"] = "auto"
 
@@ -150,92 +150,18 @@ def patch_openai_with_mcp(client):
             clean_kwargs.pop("tools", None)
             clean_kwargs.pop("tool_choice", None)
             tools = None   # subsequent turns shouldn't resend schemas
-    async def _handle_completion(self, args, model, messages,
-                               mcp_servers, mcp_strict, tools, kwargs):
-        """Shared completion logic for both sync and async paths."""
-        if mcp_servers and tools:
-            raise ValueError("Cannot specify both 'mcp_servers' and 'tools'. Use one or the other.")
-
-        if mcp_servers:
-            tools = await _prepare(mcp_servers, mcp_strict)
-
-        _get_provider(model)
-        clean_kwargs = _clean_kwargs(kwargs)
-
-        if tools and 'tool_choice' not in clean_kwargs:
-            clean_kwargs['tool_choice'] = "auto"
-
-        if is_async:
-            resp = await orig_async(
-                self, *args,
-                model=model,
-                messages=messages,
-                tools=tools,
-                **clean_kwargs
-            )
-        else:
-            resp = orig_sync(
-                self, *args,
-                model=model,
-                messages=messages,
-                tools=tools,
-                **clean_kwargs
-            )
-
-        if mcp_servers and getattr(resp.choices[0].message, "tool_calls", []):
-            first = resp.choices[0].message.tool_calls[0]
-            args_dict = (first.function.arguments
-                        if isinstance(first.function.arguments, dict)
-                        else json.loads(first.function.arguments))
-
-            result = await mcp_servers[0].call_tool(
-                first.function.name,
-                args_dict
-            )
-
-            # Create new messages array with the assistant's tool call and the tool response
-            messages = messages + [
-                {
-                    "role": "assistant",
-                    "tool_calls": [{
-                        "id": first.id,
-                        "type": "function",
-                        "function": {
-                            "name": first.function.name,
-                            "arguments": first.function.arguments
-                        }
-                    }]
-                },
-                {
-                    "role": "tool",
-                    "name": first.function.name,
-                    "content": result.dict().get("content"),
-                    "tool_call_id": first.id
-                }
-            ]
-
-            # Make the final call without tools to force a content response
-            clean_kwargs.pop('tools', None)
-            clean_kwargs.pop('tool_choice', None)
-
-            if is_async:
-                resp = await orig_async(self, *args, model=model, messages=messages, **clean_kwargs)
-            else:
-                resp = orig_sync(self, *args, model=model, messages=messages, **clean_kwargs)
-
-        return resp
 
     @wraps(Completions.create)
     def patched_sync(self, *args, model=None, messages=None,
                      mcp_servers=None, mcp_strict=False, tools=None, **kwargs):
         return _run_async(_handle_completion(self, args, model, messages,
-                                          mcp_servers, mcp_strict, tools, kwargs))
+                                          mcp_servers, mcp_strict, tools, kwargs, False))
 
     @wraps(AsyncCompletions.create)
     async def patched_async(self, *args, model=None, messages=None,
                            mcp_servers=None, mcp_strict=False, tools=None, **kwargs):
         return await _handle_completion(self, args, model, messages,
-                                     mcp_servers, mcp_strict, tools, kwargs)
+                                     mcp_servers, mcp_strict, tools, kwargs, True)
 
     # Patch only the appropriate method based on client type
     if is_async:
