@@ -5,8 +5,6 @@ import json
 from functools import wraps
 from openai.resources.chat.completions import Completions, AsyncCompletions
 from agents.mcp.util import MCPUtil
-import litellm.utils as llm_utils
-import litellm
 
 # Global server cache
 _SERVER_CACHE = {}
@@ -94,28 +92,15 @@ def patch_openai_with_mcp(client):
                 raise RuntimeError("Tool-call loop exceeded MAX_TOOL_LOOPS")
 
             # ----- make the chat completion call -----
-            if provider == "openai":
-                resp = (
-                    await orig_async(self, *args, model=model, messages=messages,
-                                     tools=tools, **clean_kwargs)
-                    if async_mode else
-                    orig_sync(self, *args, model=model, messages=messages,
-                              tools=tools, **clean_kwargs)
-                )
-            else:
-                resp = (
-                    await litellm.acompletion(model=model, messages=messages,
-                                              tools=tools, api_key=api_key,
-                                              **clean_kwargs)
-                    if async_mode else
-                    litellm.completion(model=model, messages=messages,
-                                       tools=tools, api_key=api_key,
-                                       **clean_kwargs)
-                )
+            resp = (
+                await orig_async(self, *args, model=model, messages=messages,
+                                 tools=tools, **clean_kwargs)
+                if async_mode else
+                orig_sync(self, *args, model=model, messages=messages,
+                          tools=tools, **clean_kwargs)
+            )
 
-            tcalls = getattr(
-                resp["choices"][0]["message"], "tool_calls", []
-            ) if provider != "openai" else resp.choices[0].message.tool_calls
+            tcalls = resp.choices[0].message.tool_calls
 
             if not tcalls:
                 # no more tool calls → done
@@ -123,10 +108,8 @@ def patch_openai_with_mcp(client):
 
             # consume every tool_call returned in *this* response
             for call in tcalls:
-                tname = call["function"]["name"] if provider != "openai" else call.function.name
-                targ_json = (call["function"]["arguments"]
-                             if provider != "openai"
-                             else call.function.arguments)
+                tname = call.function.name
+                targ_json = (call.function.arguments)
                 if not isinstance(targ_json, dict):
                     targ_json = json.loads(targ_json)
 
