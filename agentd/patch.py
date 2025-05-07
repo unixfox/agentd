@@ -78,7 +78,6 @@ def patch_openai_with_mcp(client):
                          for s in mcp_servers
                          for t in await s.list_tools()}
 
-        _, provider, api_key, _ = llm_utils.get_llm_provider(model)
         clean_kwargs = _clean_kwargs(kwargs)
 
         if tools and "tool_choice" not in clean_kwargs:
